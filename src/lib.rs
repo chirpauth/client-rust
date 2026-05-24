@@ -95,6 +95,17 @@ pub enum ChirpVerifiedIdentity {
         /// claim is absent — every non-operator token, including those
         /// minted before this field existed.
         is_operator: bool,
+        /// The root identity behind `sub`. For single-persona users
+        /// (the only case ChirpAuth issues today) equals `sub`. When
+        /// persona issuance ships, distinct from `sub` for any persona
+        /// that's not its own root.
+        ///
+        /// Relying parties doing anti-evasion moderation should key on
+        /// `root_sub` rather than `sub` — a banned root carries its ban
+        /// across all personas. Defaults to `sub` when the claim is
+        /// absent (handles tokens minted before this field existed,
+        /// and machine tokens are never reached on this arm).
+        root_sub: String,
     },
     Machine {
         sub: String,
@@ -177,6 +188,8 @@ struct ChirpClaims {
     name: Option<String>,
     #[serde(default)]
     is_operator: Option<bool>,
+    #[serde(default)]
+    root_sub: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,7 +380,15 @@ pub async fn verify_chirp_id_token(
         return Err(ChirpAuthError::EmailRequired);
     }
     let is_operator = claims.is_operator.unwrap_or(false);
-    Ok(ChirpVerifiedIdentity::Human { sub, email, name, is_operator })
+    // Backward-compat default: tokens minted before the `root_sub` claim
+    // existed have a single-persona identity by construction, so the
+    // root identity is the sub itself.
+    let root_sub = claims
+        .root_sub
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| sub.clone());
+    Ok(ChirpVerifiedIdentity::Human { sub, email, name, is_operator, root_sub })
 }
 
 #[cfg(test)]
@@ -470,11 +491,38 @@ mod tests {
             email: None,
             name: None,
             is_operator: true,
+            root_sub: "sub_b".into(),
         };
         match identity {
             ChirpVerifiedIdentity::Human { is_operator, .. } => assert!(is_operator),
             _ => panic!("expected Human"),
         }
+    }
+
+    #[test]
+    fn chirp_claims_parses_root_sub_when_present_and_absent() {
+        // Absent → None on the wire claim, which the verifier defaults to
+        // `sub` (single-persona limit case + backward-compat with
+        // pre-root_sub tokens).
+        let absent: ChirpClaims = serde_json::from_str(
+            r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1}"#,
+        )
+        .expect("parse");
+        assert_eq!(absent.root_sub, None);
+
+        // Present and equal to sub → today's single-persona shape.
+        let same: ChirpClaims = serde_json::from_str(
+            r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1,"root_sub":"sub_a"}"#,
+        )
+        .expect("parse");
+        assert_eq!(same.root_sub.as_deref(), Some("sub_a"));
+
+        // Present and distinct → forward-compat with persona issuance.
+        let distinct: ChirpClaims = serde_json::from_str(
+            r#"{"iss":"x","sub":"persona_xyz","aud":"x","exp":1,"root_sub":"sub_root_a"}"#,
+        )
+        .expect("parse");
+        assert_eq!(distinct.root_sub.as_deref(), Some("sub_root_a"));
     }
 
     #[test]
@@ -484,6 +532,7 @@ mod tests {
             email: None,
             name: None,
             is_operator: false,
+            root_sub: "sub_abc".into(),
         };
         assert_eq!(human.sub(), "sub_abc");
         let machine = ChirpVerifiedIdentity::Machine {
