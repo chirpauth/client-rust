@@ -543,3 +543,373 @@ mod tests {
         assert_eq!(machine.sub(), "agent_xyz");
     }
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end verify-path tests.
+//
+// The tests above this module exercise env-var parsing and malformed-shortcut
+// paths that fail before any JWKS fetch or signature check. The tests below
+// stand up an in-process JWKS server, mint real RS256 tokens against a
+// generated keypair, and assert the verifier behaves correctly on the full
+// path: signature, kid lookup, algorithm pin, issuer/audience claim, expiry,
+// machine-token gating, and a handful of adversarial constructions (alg=none,
+// alg-confusion via RS512, kid not in JWKS, issuer-suffix attack).
+//
+// One RSA-2048 keypair is generated lazily and shared across tests via
+// `OnceLock` — RSA keygen is the slow part (~200ms); reusing the key keeps
+// the suite cheap.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod verify_path_tests {
+    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    use rsa::traits::PublicKeyParts;
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use sha2::Sha256;
+    use std::sync::OnceLock;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const KID: &str = "test-kid-1";
+    const ISS: &str = "https://signin.test.example";
+    const AUD: &str = "cs_test_audience";
+
+    fn keypair() -> &'static RsaPrivateKey {
+        static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
+        KEY.get_or_init(|| {
+            let mut rng = rand::thread_rng();
+            RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key")
+        })
+    }
+
+    fn jwks_body_with_test_key() -> String {
+        let pubkey = RsaPublicKey::from(keypair());
+        let n = URL_SAFE_NO_PAD.encode(pubkey.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(pubkey.e().to_bytes_be());
+        format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"{KID}","alg":"RS256","n":"{n}","e":"{e}"}}]}}"#
+        )
+    }
+
+    /// Bind 127.0.0.1:0 and serve `body` (as application/json) to every
+    /// request that arrives until the test completes. Returns the
+    /// `http://host:port/jwks.json` URL. The server task is detached — it
+    /// dies when the test runtime tears down.
+    async fn start_jwks_server(body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/jwks.json");
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
+    fn sign_with_test_key(signing_input: &[u8]) -> Vec<u8> {
+        let signer = SigningKey::<Sha256>::new(keypair().clone());
+        let mut rng = rand::thread_rng();
+        signer.sign_with_rng(&mut rng, signing_input).to_bytes().to_vec()
+    }
+
+    fn b64(s: &str) -> String {
+        URL_SAFE_NO_PAD.encode(s.as_bytes())
+    }
+
+    /// Build a JWT from header JSON + claims JSON, signing with our test key.
+    fn make_signed_jwt(header_json: &str, claims_json: &str) -> String {
+        let signing_input = format!("{}.{}", b64(header_json), b64(claims_json));
+        let sig = sign_with_test_key(signing_input.as_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig))
+    }
+
+    /// Like `make_signed_jwt` but lets the caller substitute the signature
+    /// segment — for tampered-signature and alg-confusion tests.
+    fn make_jwt_with_signature(header_json: &str, claims_json: &str, raw_sig: &[u8]) -> String {
+        format!(
+            "{}.{}.{}",
+            b64(header_json),
+            b64(claims_json),
+            URL_SAFE_NO_PAD.encode(raw_sig)
+        )
+    }
+
+    fn now_unix() -> i64 {
+        OffsetDateTime::now_utc().unix_timestamp()
+    }
+
+    fn good_claims(iss: &str, aud: &str, exp: i64) -> String {
+        format!(
+            r#"{{"iss":"{iss}","sub":"sub_test","aud":"{aud}","exp":{exp},"email":"u@example.test"}}"#
+        )
+    }
+
+    fn good_header() -> String {
+        format!(r#"{{"alg":"RS256","typ":"JWT","kid":"{KID}"}}"#)
+    }
+
+    fn config_pointing_at(jwks_uri: String) -> ChirpAuthConfig {
+        ChirpAuthConfig {
+            issuer: ISS.into(),
+            audience: AUD.into(),
+            jwks_uri,
+        }
+    }
+
+    // -------------------- happy path --------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_a_well_formed_signed_token_as_human() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        let identity = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .expect("verify");
+        match identity {
+            ChirpVerifiedIdentity::Human { sub, email, .. } => {
+                assert_eq!(sub, "sub_test");
+                assert_eq!(email.as_deref(), Some("u@example.test"));
+            }
+            _ => panic!("expected Human"),
+        }
+    }
+
+    // -------------------- adversarial paths --------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_token_with_tampered_signature() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        // Flip the last char of the signature segment.
+        let mut chars: Vec<char> = token.chars().collect();
+        let i = chars.len() - 1;
+        chars[i] = if chars[i] == 'A' { 'B' } else { 'A' };
+        let tampered: String = chars.into_iter().collect();
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &tampered,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::SignatureInvalid), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_expired_token() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() - 1));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::Expired), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_wrong_audience() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(
+            &good_header(),
+            &good_claims(ISS, "cs_test_someone_else", now_unix() + 3600),
+        );
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::ClaimMismatch), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_wrong_issuer() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(
+            &good_header(),
+            &good_claims("https://attacker.test", AUD, now_unix() + 3600),
+        );
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::ClaimMismatch), "got {err:?}");
+    }
+
+    /// Classic issuer-suffix trick: a token whose `iss` ends with the
+    /// expected issuer string but is actually a different domain. Exact
+    /// equality (not `ends_with`) must reject.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_issuer_suffix_attack() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        // Note: not `https://signin.test.example.attacker.test` (suffix
+        // append) because the expected ISS doesn't have a trailing slash; the
+        // attack the test demonstrates is the symmetric "iss prepended" form
+        // that a naive `.contains(expected)` check would let through.
+        let attacker_iss = format!("https://attacker.test/path/{ISS}");
+        let token = make_signed_jwt(
+            &good_header(),
+            &good_claims(&attacker_iss, AUD, now_unix() + 3600),
+        );
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::ClaimMismatch), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_alg_none_token() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        // alg=none with empty signature is the classic "none" attack.
+        // Our verifier rejects this at jwt_parts (empty signature segment)
+        // OR at the alg pin if non-empty. Either rejection is acceptable;
+        // assert one of the two well-defined errors.
+        let header = format!(r#"{{"alg":"none","typ":"JWT","kid":"{KID}"}}"#);
+        let claims = good_claims(ISS, AUD, now_unix() + 3600);
+        let token = format!("{}.{}.", b64(&header), b64(&claims));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ChirpAuthError::MalformedToken | ChirpAuthError::UnsupportedAlgorithm),
+            "got {err:?}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_explicit_other_algorithm() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let header = format!(r#"{{"alg":"RS512","typ":"JWT","kid":"{KID}"}}"#);
+        let claims = good_claims(ISS, AUD, now_unix() + 3600);
+        // Any garbage in the signature slot — verifier rejects on alg pin
+        // before touching it.
+        let token = make_jwt_with_signature(&header, &claims, &[0u8; 32]);
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::UnsupportedAlgorithm), "got {err:?}");
+    }
+
+    /// Algorithm-confusion / kid-confusion: token claims an RS256 alg with
+    /// a kid the JWKS doesn't advertise. Must fail at key lookup, not
+    /// silently accept against some other key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_unknown_kid() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let header = r#"{"alg":"RS256","typ":"JWT","kid":"never-issued"}"#;
+        let claims = good_claims(ISS, AUD, now_unix() + 3600);
+        let token = make_jwt_with_signature(header, &claims, &[0u8; 256]);
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::NoMatchingKey), "got {err:?}");
+    }
+
+    /// Machine tokens are rejected by default. Every Drive/Pigeon/Social-
+    /// Graph code path that uses the default `VerifyOptions` relies on this.
+    /// Confirm the verifier does not silently downgrade a machine token to
+    /// a Human identity (and that the rejection happens AFTER signature
+    /// validation, so the test mints a real signed machine token).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_machine_token_when_accept_machine_false() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let exp = now_unix() + 3600;
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"agent_test","aud":"{AUD}","exp":{exp},"act":"machine","owner_sub":"sub_owner"}}"#
+        );
+        let token = make_signed_jwt(&good_header(), &claims);
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::MachineNotAllowed), "got {err:?}");
+    }
+
+    /// Inverse: machine token IS accepted when opted in, and the Machine
+    /// variant carries through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_machine_token_when_accept_machine_true() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let exp = now_unix() + 3600;
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"agent_test","aud":"{AUD}","exp":{exp},"act":"machine","owner_sub":"sub_owner"}}"#
+        );
+        let token = make_signed_jwt(&good_header(), &claims);
+        let identity = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions { require_email: false, accept_machine: true },
+        )
+        .await
+        .expect("verify machine");
+        match identity {
+            ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => {
+                assert_eq!(sub, "agent_test");
+                assert_eq!(owner_sub, "sub_owner");
+                assert_eq!(client_id, AUD);
+            }
+            _ => panic!("expected Machine"),
+        }
+    }
+}

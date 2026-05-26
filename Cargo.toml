@@ -20,4 +20,10 @@ thiserror = "1"
 time = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
+# Test-only: mint signed tokens + serve a JWKS to exercise the verify path
+# end-to-end (the existing test module only covered malformed-shortcut
+# paths that never reached the JWKS fetch or signature check).
+rsa = { version = "0.9", default-features = false, features = ["sha2", "std"] }
+sha2 = "0.10"
+rand = "0.8"
