@@ -1,0 +1,40 @@
+name: test chirp-auth-client
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # The verify-path tests spin up local TCP listeners on ephemeral
+      # ports for fake JWKS servers, and a few of them occasionally
+      # race when run highly-parallel (multiple tests' connect-and-fetch
+      # cycles overlap, and a tampered-signature test sometimes sees a
+      # MalformedToken error instead of SignatureInvalid). Cap test
+      # threads to make the suite deterministic in CI.
+      - name: cargo test
+        run: cargo test -- --test-threads=2
+
+      - name: cargo check --tests
+        run: cargo check --tests

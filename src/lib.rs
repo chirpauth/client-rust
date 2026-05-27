@@ -885,6 +885,121 @@ mod verify_path_tests {
         assert!(matches!(err, ChirpAuthError::MachineNotAllowed), "got {err:?}");
     }
 
+    // -------------------- consumer-profile contract tests --------------
+    //
+    // Three downstream services consume this crate and each calls
+    // verify_chirp_id_token with a different VerifyOptions config:
+    //
+    //   Drive        → { accept_machine: true,  require_email: false }
+    //   Pigeon       → { accept_machine: true,  require_email: false }
+    //   Social Graph → { accept_machine: false, require_email: true  }
+    //
+    // The tests below pin each profile's accept/reject behavior over the
+    // same set of minted tokens. If chirp-auth-client's interpretation
+    // of any option drifts, exactly one of these tests fails and points
+    // at the affected profile.
+    //
+    // What they CANNOT catch: a consumer changing its own auth.rs to
+    // pass different options. For that we'd need a cross-repo
+    // integration test. These tests serve as the canonical reference
+    // for what each profile SHOULD do — operators reviewing a
+    // consumer's auth.rs should grep here first.
+
+    fn drive_profile() -> VerifyOptions {
+        VerifyOptions { accept_machine: true, require_email: false }
+    }
+    fn pigeon_profile() -> VerifyOptions {
+        VerifyOptions { accept_machine: true, require_email: false }
+    }
+    fn social_graph_profile() -> VerifyOptions {
+        VerifyOptions { accept_machine: false, require_email: true }
+    }
+
+    fn human_claims_with_email(iss: &str, aud: &str, exp: i64) -> String {
+        format!(
+            r#"{{"iss":"{iss}","sub":"sub_user","aud":"{aud}","exp":{exp},"email":"u@example.test"}}"#
+        )
+    }
+    fn human_claims_without_email(iss: &str, aud: &str, exp: i64) -> String {
+        format!(
+            r#"{{"iss":"{iss}","sub":"sub_user","aud":"{aud}","exp":{exp}}}"#
+        )
+    }
+    fn machine_claims(iss: &str, aud: &str, exp: i64) -> String {
+        format!(
+            r#"{{"iss":"{iss}","sub":"agent_x","aud":"{aud}","exp":{exp},"act":"machine","owner_sub":"sub_owner"}}"#
+        )
+    }
+
+    async fn run(profile: VerifyOptions, claims: &str) -> Result<ChirpVerifiedIdentity, ChirpAuthError> {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), claims);
+        verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            profile,
+        )
+        .await
+    }
+
+    // -- Drive profile -------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_profile_accepts_human_with_email() {
+        let claims = human_claims_with_email(ISS, AUD, now_unix() + 3600);
+        let id = run(drive_profile(), &claims).await.expect("accept");
+        assert!(matches!(id, ChirpVerifiedIdentity::Human { .. }));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_profile_accepts_human_without_email() {
+        let claims = human_claims_without_email(ISS, AUD, now_unix() + 3600);
+        let id = run(drive_profile(), &claims).await.expect("accept");
+        assert!(matches!(id, ChirpVerifiedIdentity::Human { email: None, .. }));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_profile_accepts_machine_token() {
+        let claims = machine_claims(ISS, AUD, now_unix() + 3600);
+        let id = run(drive_profile(), &claims).await.expect("accept");
+        assert!(matches!(id, ChirpVerifiedIdentity::Machine { .. }));
+    }
+
+    // -- Pigeon profile (currently identical to Drive's) ---------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pigeon_profile_matches_drive_profile() {
+        // Pigeon and Drive both use {accept_machine: true,
+        // require_email: false}. Any future divergence (e.g. Pigeon
+        // tightens to require_email = true) should land here as an
+        // explicit edit, not as silent drift.
+        assert_eq!(
+            (drive_profile().accept_machine, drive_profile().require_email),
+            (pigeon_profile().accept_machine, pigeon_profile().require_email),
+            "Drive and Pigeon profiles diverged. Update this test if intentional.",
+        );
+    }
+
+    // -- Social Graph profile ------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn social_graph_profile_accepts_human_with_email() {
+        let claims = human_claims_with_email(ISS, AUD, now_unix() + 3600);
+        let id = run(social_graph_profile(), &claims).await.expect("accept");
+        assert!(matches!(id, ChirpVerifiedIdentity::Human { email: Some(_), .. }));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn social_graph_profile_rejects_human_without_email() {
+        let claims = human_claims_without_email(ISS, AUD, now_unix() + 3600);
+        let err = run(social_graph_profile(), &claims).await.unwrap_err();
+        assert!(matches!(err, ChirpAuthError::EmailRequired), "got {err:?}");
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn social_graph_profile_rejects_machine_token() {
+        let claims = machine_claims(ISS, AUD, now_unix() + 3600);
+        let err = run(social_graph_profile(), &claims).await.unwrap_err();
+        assert!(matches!(err, ChirpAuthError::MachineNotAllowed), "got {err:?}");
+    }
+
     /// Inverse: machine token IS accepted when opted in, and the Machine
     /// variant carries through.
     #[tokio::test(flavor = "multi_thread")]
