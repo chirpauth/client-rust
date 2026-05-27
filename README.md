@@ -41,6 +41,17 @@ match identity {
 reading `{PREFIX}_ISSUER` / `{PREFIX}_AUDIENCE` from the environment (pass an
 empty prefix for unprefixed `CHIRP_AUTH_*`).
 
+## Testing
+
+```sh
+cargo test
+```
+
+26 tests cover the end-to-end verify path (signed-by-test-keypair tokens
+against an in-process JWKS server) plus consumer-profile contract tests
+that pin the `VerifyOptions` shapes Drive, Pigeon, and Social Graph each
+use. CI runs the suite on every push and PR.
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.
