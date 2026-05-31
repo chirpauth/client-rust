@@ -20,6 +20,15 @@
 //! across the 0.1 → 0.2 upgrade; the breaking change is that the returned
 //! [`ChirpVerifiedIdentity`] is now an enum, so call sites must `match` on
 //! `Human { .. }` instead of accessing fields directly.
+//!
+//! ChirpAuth's test deployments (and test harnesses) mint tokens carrying
+//! `test: true`. Production relying parties MUST reject these. The verifier
+//! rejects any token with `test == true` with [`ChirpAuthError::TestTokenRejected`]
+//! unless the caller opts in with [`VerifyOptions::accept_test`] (default
+//! `false`). This is defense-in-depth: a relying party that accidentally
+//! points at a test issuer, or is handed a test token, fails closed rather
+//! than honoring it. Only test harnesses and test deployments set
+//! `accept_test: true`.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -138,6 +147,11 @@ pub struct VerifyOptions {
     /// When `true`, accept machine tokens (`act == "machine"`) in addition to
     /// human tokens. Default `false`.
     pub accept_machine: bool,
+    /// When `true`, accept tokens carrying `test == true` (minted by ChirpAuth
+    /// test deployments / test harnesses). Default `false` — production relying
+    /// parties reject test tokens with [`ChirpAuthError::TestTokenRejected`].
+    /// Only test harnesses and test deployments should set this.
+    pub accept_test: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +178,8 @@ pub enum ChirpAuthError {
     MachineNotAllowed,
     #[error("machine token missing owner_sub")]
     MalformedMachineToken,
+    #[error("test token not accepted by this endpoint")]
+    TestTokenRejected,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +206,8 @@ struct ChirpClaims {
     is_operator: Option<bool>,
     #[serde(default)]
     root_sub: Option<String>,
+    #[serde(default)]
+    test: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +304,12 @@ fn verify_rsa_signature(
 /// arm in practice — the verifier rejects with [`ChirpAuthError::MachineNotAllowed`]
 /// first.
 ///
+/// Tokens carrying `test == true` are rejected with
+/// [`ChirpAuthError::TestTokenRejected`] unless `options.accept_test` is set
+/// (default `false`). This is the secure default: a production relying party
+/// using [`VerifyOptions::default`] never honors a test token, even if it is
+/// otherwise valid (signature, issuer, audience, expiry all check out).
+///
 /// Errors are mapped granularly so the caller can decide which to surface as
 /// "401 Unauthorized" vs "500 Internal" — most consumers collapse everything
 /// to 401, which is correct.
@@ -338,6 +362,14 @@ pub async fn verify_chirp_id_token(
     }
     if claims.exp <= OffsetDateTime::now_utc().unix_timestamp() {
         return Err(ChirpAuthError::Expired);
+    }
+    // Defense-in-depth: test tokens (minted by ChirpAuth test deployments /
+    // harnesses) are rejected unless the caller explicitly opted in. This
+    // catches a production relying party that accidentally points at a test
+    // issuer or is handed a test token — it fails closed. Applies to both
+    // human and machine shapes.
+    if claims.test == Some(true) && !options.accept_test {
+        return Err(ChirpAuthError::TestTokenRejected);
     }
     let sub = claims.sub.trim().to_owned();
     if sub.is_empty() || sub.chars().count() > 128 || sub.chars().any(char::is_control) {
@@ -523,6 +555,30 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(distinct.root_sub.as_deref(), Some("sub_root_a"));
+    }
+
+    #[test]
+    fn chirp_claims_parses_test_flag_when_present_and_absent() {
+        // Absent → None, which the verifier treats as "not a test token".
+        let absent: ChirpClaims = serde_json::from_str(
+            r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1}"#,
+        )
+        .expect("parse");
+        assert_eq!(absent.test, None);
+
+        // Present and true → the value the verifier gates rejection on.
+        let present: ChirpClaims = serde_json::from_str(
+            r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1,"test":true}"#,
+        )
+        .expect("parse");
+        assert_eq!(present.test, Some(true));
+    }
+
+    #[test]
+    fn verify_options_default_rejects_test_tokens() {
+        // The whole point of the secure default: a caller doing
+        // VerifyOptions::default() must NOT be opted into test tokens.
+        assert!(!VerifyOptions::default().accept_test);
     }
 
     #[test]
@@ -906,13 +962,13 @@ mod verify_path_tests {
     // consumer's auth.rs should grep here first.
 
     fn drive_profile() -> VerifyOptions {
-        VerifyOptions { accept_machine: true, require_email: false }
+        VerifyOptions { accept_machine: true, require_email: false, ..Default::default() }
     }
     fn pigeon_profile() -> VerifyOptions {
-        VerifyOptions { accept_machine: true, require_email: false }
+        VerifyOptions { accept_machine: true, require_email: false, ..Default::default() }
     }
     fn social_graph_profile() -> VerifyOptions {
-        VerifyOptions { accept_machine: false, require_email: true }
+        VerifyOptions { accept_machine: false, require_email: true, ..Default::default() }
     }
 
     fn human_claims_with_email(iss: &str, aud: &str, exp: i64) -> String {
@@ -1014,7 +1070,7 @@ mod verify_path_tests {
             &reqwest::Client::new(),
             &config_pointing_at(jwks),
             &token,
-            VerifyOptions { require_email: false, accept_machine: true },
+            VerifyOptions { require_email: false, accept_machine: true, ..Default::default() },
         )
         .await
         .expect("verify machine");
@@ -1026,5 +1082,68 @@ mod verify_path_tests {
             }
             _ => panic!("expected Machine"),
         }
+    }
+
+    // -------------------- test-token gating --------------------
+    //
+    // ChirpAuth test deployments mint tokens with `test: true`. A production
+    // relying party using the default options must reject them even though
+    // they are otherwise fully valid (real signature, matching iss/aud, not
+    // expired). Test harnesses opt in with accept_test: true.
+
+    fn human_test_claims(iss: &str, aud: &str, exp: i64) -> String {
+        format!(
+            r#"{{"iss":"{iss}","sub":"sub_test","aud":"{aud}","exp":{exp},"email":"u@example.test","test":true}}"#
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_test_token_by_default() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &human_test_claims(ISS, AUD, now_unix() + 3600));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::TestTokenRejected), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_test_token_when_accept_test_true() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &human_test_claims(ISS, AUD, now_unix() + 3600));
+        let identity = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions { accept_test: true, ..Default::default() },
+        )
+        .await
+        .expect("verify test token");
+        match identity {
+            ChirpVerifiedIdentity::Human { sub, .. } => assert_eq!(sub, "sub_test"),
+            _ => panic!("expected Human"),
+        }
+    }
+
+    /// A non-test token must still be accepted under the default options —
+    /// the new gate only fires on `test == true`, never on its absence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_non_test_token_by_default() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        let identity = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .expect("verify non-test token");
+        assert!(matches!(identity, ChirpVerifiedIdentity::Human { .. }));
     }
 }
