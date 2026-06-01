@@ -718,11 +718,17 @@ mod verify_path_tests {
     async fn rejects_token_with_tampered_signature() {
         let jwks = start_jwks_server(jwks_body_with_test_key()).await;
         let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
-        // Flip the last char of the signature segment.
-        let mut chars: Vec<char> = token.chars().collect();
-        let i = chars.len() - 1;
-        chars[i] = if chars[i] == 'A' { 'B' } else { 'A' };
-        let tampered: String = chars.into_iter().collect();
+        // Corrupt the FIRST char of the signature segment. The first base64
+        // char maps to a full leading byte, so flipping it always changes the
+        // signature bytes (→ SignatureInvalid) while staying canonical base64.
+        // Flipping the LAST char instead can land on non-canonical trailing
+        // bits, which the decoder rejects as MalformedToken — and since the
+        // signature varies per run (claims carry a live exp), that made the
+        // expected-error assertion flaky.
+        let (head, sig) = token.rsplit_once('.').expect("jwt has signature segment");
+        let mut sig_chars: Vec<char> = sig.chars().collect();
+        sig_chars[0] = if sig_chars[0] == 'A' { 'B' } else { 'A' };
+        let tampered: String = format!("{head}.{}", sig_chars.into_iter().collect::<String>());
         let err = verify_chirp_id_token(
             &reqwest::Client::new(),
             &config_pointing_at(jwks),
