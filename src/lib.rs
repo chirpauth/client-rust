@@ -97,13 +97,6 @@ pub enum ChirpVerifiedIdentity {
         sub: String,
         email: Option<String>,
         name: Option<String>,
-        /// `true` when ChirpAuth's stored developer record for this `sub`
-        /// has `is_operator = true`. Surfaced so relying parties can gate
-        /// operator-only surfaces (e.g. social-graph's moderation
-        /// endpoints) on a per-token basis. Defaults to `false` when the
-        /// claim is absent — every non-operator token, including those
-        /// minted before this field existed.
-        is_operator: bool,
         /// The root identity behind `sub`. For single-persona users
         /// (the only case ChirpAuth issues today) equals `sub`. When
         /// persona issuance ships, distinct from `sub` for any persona
@@ -202,8 +195,6 @@ struct ChirpClaims {
     email: Option<String>,
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    is_operator: Option<bool>,
     #[serde(default)]
     root_sub: Option<String>,
     #[serde(default)]
@@ -411,7 +402,6 @@ pub async fn verify_chirp_id_token(
     if options.require_email && email.is_none() {
         return Err(ChirpAuthError::EmailRequired);
     }
-    let is_operator = claims.is_operator.unwrap_or(false);
     // Backward-compat default: tokens minted before the `root_sub` claim
     // existed have a single-persona identity by construction, so the
     // root identity is the sub itself.
@@ -420,7 +410,7 @@ pub async fn verify_chirp_id_token(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| sub.clone());
-    Ok(ChirpVerifiedIdentity::Human { sub, email, name, is_operator, root_sub })
+    Ok(ChirpVerifiedIdentity::Human { sub, email, name, root_sub })
 }
 
 #[cfg(test)]
@@ -500,38 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn chirp_auth_client_verify_surfaces_is_operator() {
-        // Deserialize the claim shape directly — exercising the absent-claim
-        // and present-true paths without standing up a full JWKS / JWT
-        // verification harness. The Default `false` for absent and the
-        // surfaced `true` for present are both load-bearing.
-        let absent: ChirpClaims = serde_json::from_str(
-            r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1}"#,
-        )
-        .expect("parse");
-        assert_eq!(absent.is_operator, None);
-
-        let present: ChirpClaims = serde_json::from_str(
-            r#"{"iss":"x","sub":"sub_b","aud":"x","exp":1,"is_operator":true}"#,
-        )
-        .expect("parse");
-        assert_eq!(present.is_operator, Some(true));
-
-        // And the identity shape carries the bool through.
-        let identity = ChirpVerifiedIdentity::Human {
-            sub: "sub_b".into(),
-            email: None,
-            name: None,
-            is_operator: true,
-            root_sub: "sub_b".into(),
-        };
-        match identity {
-            ChirpVerifiedIdentity::Human { is_operator, .. } => assert!(is_operator),
-            _ => panic!("expected Human"),
-        }
-    }
-
-    #[test]
     fn chirp_claims_parses_root_sub_when_present_and_absent() {
         // Absent → None on the wire claim, which the verifier defaults to
         // `sub` (single-persona limit case + backward-compat with
@@ -587,7 +545,6 @@ mod tests {
             sub: "sub_abc".into(),
             email: None,
             name: None,
-            is_operator: false,
             root_sub: "sub_abc".into(),
         };
         assert_eq!(human.sub(), "sub_abc");
