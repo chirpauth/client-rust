@@ -21,13 +21,23 @@
 //! [`ChirpVerifiedIdentity`] is now an enum, so call sites must `match` on
 //! `Human { .. }` instead of accessing fields directly.
 //!
-//! ChirpAuth's test deployments (and test harnesses) mint tokens carrying
-//! `test: true`. Production relying parties MUST reject these. The verifier
-//! rejects any token with `test == true` with [`ChirpAuthError::TestTokenRejected`]
-//! unless the caller opts in with [`VerifyOptions::accept_test`] (default
-//! `false`). This is defense-in-depth: a relying party that accidentally
-//! points at a test issuer, or is handed a test token, fails closed rather
-//! than honoring it. Only test harnesses and test deployments set
+//! [`verify_chirp_id_token`] returns a [`ChirpVerifiedToken`] carrying two
+//! orthogonal axes: the [`Environment`] (`Production`/`Test`) the verifying
+//! keyset belongs to — **provenance, derived from which issuer/JWKS matched,
+//! not from any claim** — and the [`ChirpVerifiedIdentity`] principal
+//! (`Human`/`Machine`). A relying party therefore cannot mistake a test
+//! identity for a production one, or a machine for a human, by forgetting a
+//! marker: both distinctions are in the type. Access the principal via
+//! `token.identity`.
+//!
+//! Test identity is structural, not claim-based: ChirpAuth signs test tokens
+//! with a per-tenant test key under a `{issuer}/test/{tenant}` issuer whose JWKS
+//! is disjoint from the prod JWKS, so a verifier configured with only the
+//! production issuer can never yield [`Environment::Test`] — it is unreachable
+//! by construction. The legacy `test: true` claim reject ([`VerifyOptions::accept_test`],
+//! default `false` → [`ChirpAuthError::TestTokenRejected`]) is retained as
+//! defense-in-depth for a relying party that misconfigures itself onto a test
+//! issuer during migration. Only test harnesses / test deployments set
 //! `accept_test: true`.
 
 use base64::Engine as _;
@@ -123,6 +133,45 @@ impl ChirpVerifiedIdentity {
             Self::Human { sub, .. } | Self::Machine { sub, .. } => sub,
         }
     }
+}
+
+/// Which ChirpAuth keyset verified this token — **provenance, not a claim**.
+///
+/// Derived from the issuer the token was verified against (and matched
+/// exactly): a ChirpAuth test issuer is structurally `{prod_issuer}/test/{tenant}`
+/// with its own per-tenant signing key and JWKS. A relying party configured with
+/// only the production issuer therefore *cannot* observe [`Environment::Test`] —
+/// it is unreachable by construction (a test token's `kid` is absent from the
+/// prod JWKS and its `iss` won't match). Carry this into trust decisions so a
+/// test identity can never be mistaken for a production one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Environment {
+    Production,
+    Test,
+}
+
+impl Environment {
+    /// Classify a verified issuer. A test issuer ends in a single non-empty
+    /// `/test/{tenant}` segment; everything else is production.
+    pub fn from_issuer(issuer: &str) -> Self {
+        match issuer.trim_end_matches('/').rsplit_once("/test/") {
+            Some((_, tenant)) if !tenant.is_empty() && !tenant.contains('/') => Environment::Test,
+            _ => Environment::Production,
+        }
+    }
+}
+
+/// A verified token: its [`Environment`] (provenance — which keyset verified it)
+/// alongside the [`ChirpVerifiedIdentity`] (the `Human`/`Machine` principal).
+///
+/// Both axes are surfaced in the type so a relying party cannot honor a test
+/// identity as production, or a machine where it expects a human, by forgetting
+/// to inspect a marker — the distinction is structural, not a runtime check the
+/// caller might skip.
+#[derive(Clone, Debug)]
+pub struct ChirpVerifiedToken {
+    pub environment: Environment,
+    pub identity: ChirpVerifiedIdentity,
 }
 
 /// Per-call knobs for [`verify_chirp_id_token`].
@@ -309,7 +358,7 @@ pub async fn verify_chirp_id_token(
     config: &ChirpAuthConfig,
     token: &str,
     options: VerifyOptions,
-) -> Result<ChirpVerifiedIdentity, ChirpAuthError> {
+) -> Result<ChirpVerifiedToken, ChirpAuthError> {
     let parts = jwt_parts(token)?;
     let header_bytes = URL_SAFE_NO_PAD
         .decode(parts.header)
@@ -367,6 +416,11 @@ pub async fn verify_chirp_id_token(
         return Err(ChirpAuthError::InvalidSubject);
     }
 
+    // Provenance: the environment is fixed by which issuer (hence which keyset)
+    // verified this token — `claims.iss` was just confirmed to equal
+    // `config.issuer`. A prod-issuer RP can only ever yield `Production` here.
+    let environment = Environment::from_issuer(&config.issuer);
+
     let is_machine = matches!(claims.act.as_deref(), Some("machine"));
     if is_machine {
         if !options.accept_machine {
@@ -384,10 +438,13 @@ pub async fn verify_chirp_id_token(
             .single()
             .map(str::to_owned)
             .ok_or(ChirpAuthError::MalformedMachineToken)?;
-        return Ok(ChirpVerifiedIdentity::Machine {
-            sub,
-            owner_sub,
-            client_id,
+        return Ok(ChirpVerifiedToken {
+            environment,
+            identity: ChirpVerifiedIdentity::Machine {
+                sub,
+                owner_sub,
+                client_id,
+            },
         });
     }
 
@@ -410,7 +467,10 @@ pub async fn verify_chirp_id_token(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| sub.clone());
-    Ok(ChirpVerifiedIdentity::Human { sub, email, name, root_sub })
+    Ok(ChirpVerifiedToken {
+        environment,
+        identity: ChirpVerifiedIdentity::Human { sub, email, name, root_sub },
+    })
 }
 
 #[cfg(test)]
@@ -576,7 +636,6 @@ mod tests {
 #[cfg(test)]
 mod verify_path_tests {
     use super::*;
-    use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rsa::pkcs1v15::SigningKey;
     use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -703,7 +762,8 @@ mod verify_path_tests {
         )
         .await
         .expect("verify");
-        match identity {
+        assert_eq!(identity.environment, Environment::Production);
+        match identity.identity {
             ChirpVerifiedIdentity::Human { sub, email, .. } => {
                 assert_eq!(sub, "sub_test");
                 assert_eq!(email.as_deref(), Some("u@example.test"));
@@ -960,6 +1020,7 @@ mod verify_path_tests {
             profile,
         )
         .await
+        .map(|verified| verified.identity)
     }
 
     // -- Drive profile -------------------------------------------------------
@@ -1037,7 +1098,8 @@ mod verify_path_tests {
         )
         .await
         .expect("verify machine");
-        match identity {
+        assert_eq!(identity.environment, Environment::Production);
+        match identity.identity {
             ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => {
                 assert_eq!(sub, "agent_test");
                 assert_eq!(owner_sub, "sub_owner");
@@ -1087,7 +1149,7 @@ mod verify_path_tests {
         )
         .await
         .expect("verify test token");
-        match identity {
+        match identity.identity {
             ChirpVerifiedIdentity::Human { sub, .. } => assert_eq!(sub, "sub_test"),
             _ => panic!("expected Human"),
         }
@@ -1107,6 +1169,47 @@ mod verify_path_tests {
         )
         .await
         .expect("verify non-test token");
-        assert!(matches!(identity, ChirpVerifiedIdentity::Human { .. }));
+        assert!(matches!(identity.identity, ChirpVerifiedIdentity::Human { .. }));
+    }
+
+    // -------------------- environment (provenance) axis --------------------
+
+    #[test]
+    fn environment_from_issuer_classifies_provenance() {
+        use Environment::{Production, Test};
+        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com"), Production);
+        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/"), Production);
+        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/acme"), Test);
+        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/acme/"), Test);
+        // multi-segment after /test/ is not a valid single-tenant test issuer
+        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/a/b"), Production);
+        // empty tenant, and a host merely named "test", are production
+        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/"), Production);
+        assert_eq!(Environment::from_issuer("https://test.example.com"), Production);
+    }
+
+    /// Provenance end-to-end: a token verified against a `/test/{tenant}` issuer
+    /// is reported as `Environment::Test` — derived from which issuer/keyset
+    /// matched, not from any claim in the token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_issuer_yields_environment_test() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let test_iss = format!("{ISS}/test/acme");
+        let token = make_signed_jwt(&good_header(), &good_claims(&test_iss, AUD, now_unix() + 3600));
+        let config = ChirpAuthConfig {
+            issuer: test_iss,
+            audience: AUD.into(),
+            jwks_uri: jwks,
+        };
+        let verified = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config,
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .expect("verify test-issuer token");
+        assert_eq!(verified.environment, Environment::Test);
+        assert!(matches!(verified.identity, ChirpVerifiedIdentity::Human { .. }));
     }
 }
