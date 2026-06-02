@@ -16,10 +16,9 @@
 //!   `email`. See `protocols/specs/machine-identity.md`.
 //!
 //! Callers opt in to machine acceptance with [`VerifyOptions::accept_machine`]
-//! (default `false`). Services that only handle humans don't change behavior
-//! across the 0.1 → 0.2 upgrade; the breaking change is that the returned
-//! [`ChirpVerifiedIdentity`] is now an enum, so call sites must `match` on
-//! `Human { .. }` instead of accessing fields directly.
+//! (default `false`). Services that only handle humans don't change behavior;
+//! the returned [`ChirpVerifiedIdentity`] is an enum, so call sites `match` on
+//! `Human { .. }` / `Machine { .. }`.
 //!
 //! [`verify_chirp_id_token`] returns a [`ChirpVerifiedToken`] carrying two
 //! orthogonal axes: the [`Environment`] (`Production`/`Test`) the verifying
@@ -30,56 +29,140 @@
 //! marker: both distinctions are in the type. Access the principal via
 //! `token.identity`.
 //!
-//! Test identity is structural, not claim-based: ChirpAuth signs test tokens
-//! with a per-tenant test key under a `{issuer}/test/{tenant}` issuer whose JWKS
-//! is disjoint from the prod JWKS, so a verifier configured with only the
-//! production issuer can never yield [`Environment::Test`] — it is unreachable
-//! by construction. The legacy `test: true` claim reject ([`VerifyOptions::accept_test`],
-//! default `false` → [`ChirpAuthError::TestTokenRejected`]) is retained as
-//! defense-in-depth for a relying party that misconfigures itself onto a test
-//! issuer during migration. Only test harnesses / test deployments set
-//! `accept_test: true`.
+//! ## Environment enforcement (0.7)
+//!
+//! The environment axis is now **enforced**, not merely reported. The verifier
+//! derives the expected [`Environment`] from the configured issuer
+//! ([`ChirpAuthConfig::environment`]) and rejects any token whose provenance
+//! disagrees:
+//!
+//! - A **production**-configured relying party rejects a token carrying
+//!   `test == true` with [`ChirpAuthError::EnvironmentMismatch`].
+//! - A **test**-configured relying party (issuer `…/test/{tenant}`) rejects a
+//!   token that does *not* carry `test == true`, also with
+//!   [`ChirpAuthError::EnvironmentMismatch`].
+//!
+//! Test-acceptance is therefore derived from the issuer's environment, not from
+//! a per-call flag. The old [`VerifyOptions::accept_test`] field is retained as
+//! a deprecated no-op so 0.6 callers still compile; it no longer affects policy.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, RsaPublicKeyComponents};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use time::OffsetDateTime;
+
+/// The canonical production ChirpAuth issuer.
+///
+/// Consumers should derive their [`ChirpAuthConfig`] from this rather than
+/// re-typing the URL; a typo in an issuer string is a silent
+/// [`ChirpAuthError::ClaimMismatch`] at runtime.
+pub const DEFAULT_ISSUER: &str = "https://signin.chirpauth.com";
 
 /// Endpoint and audience to verify ChirpAuth tokens against.
 ///
-/// `jwks_uri` defaults to `{issuer}/jwks.json` when constructed via
-/// [`ChirpAuthConfig::from_env`]; callers can override by constructing the
-/// struct directly (e.g. tests pointing at a mock server).
+/// Construct via [`ChirpAuthConfig::new`] (or [`ChirpAuthConfig::from_env`]).
+/// The `jwks_uri` is **derived** (`{issuer}/jwks.json`) and cannot be set
+/// independently of the issuer — this removes a whole class of misconfiguration
+/// where a relying party verifies issuer A's claims against issuer B's keyset.
+/// Tests that need to point the fetch at an in-process server use
+/// [`ChirpAuthConfig::with_jwks_uri`].
 #[derive(Clone, Debug)]
 pub struct ChirpAuthConfig {
-    pub issuer: String,
-    pub audience: String,
-    pub jwks_uri: String,
+    issuer: String,
+    jwks_uri: String,
+    /// The set of audiences this relying party accepts. A token is accepted if
+    /// *any* of its `aud` values is in this set. Always non-empty.
+    accepted_audiences: BTreeSet<String>,
 }
 
 impl ChirpAuthConfig {
+    /// Build a config for a single audience.
+    ///
+    /// The issuer is normalized (trimmed, trailing slash stripped) and the
+    /// `jwks_uri` is derived as `{issuer}/jwks.json`.
+    pub fn new(issuer: impl Into<String>, audience: impl Into<String>) -> Self {
+        Self::with_audiences(issuer, std::iter::once(audience.into()))
+    }
+
+    /// Build a config that accepts any of several audiences (an allowlist).
+    ///
+    /// A token is accepted when *any* of its `aud` values is in `audiences`,
+    /// checked in a single pass — callers no longer loop a verify-per-audience.
+    /// An empty `audiences` iterator yields a config that accepts nothing
+    /// (every token fails `aud` matching with [`ChirpAuthError::ClaimMismatch`]).
+    pub fn with_audiences(
+        issuer: impl Into<String>,
+        audiences: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let issuer = normalize_issuer(issuer.into());
+        let jwks_uri = format!("{issuer}/jwks.json");
+        Self {
+            issuer,
+            jwks_uri,
+            accepted_audiences: audiences.into_iter().map(|a| a.trim().to_owned()).collect(),
+        }
+    }
+
+    /// Override the JWKS fetch URL. **Test-only**: production callers must let
+    /// the URL derive from the issuer. Returns `self` for chaining.
+    pub fn with_jwks_uri(mut self, jwks_uri: impl Into<String>) -> Self {
+        self.jwks_uri = jwks_uri.into();
+        self
+    }
+
+    /// Add another accepted audience to the allowlist.
+    pub fn add_audience(mut self, audience: impl Into<String>) -> Self {
+        self.accepted_audiences.insert(audience.into().trim().to_owned());
+        self
+    }
+
+    /// The normalized issuer this config verifies against.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// The derived JWKS endpoint.
+    pub fn jwks_uri(&self) -> &str {
+        &self.jwks_uri
+    }
+
+    /// The audience allowlist.
+    pub fn accepted_audiences(&self) -> &BTreeSet<String> {
+        &self.accepted_audiences
+    }
+
+    /// The [`Environment`] this config's issuer belongs to — the provenance
+    /// the verifier enforces. A production issuer yields
+    /// [`Environment::Production`]; a `…/test/{tenant}` issuer yields
+    /// [`Environment::Test`].
+    pub fn environment(&self) -> Environment {
+        Environment::from_issuer(&self.issuer)
+    }
+
     /// Build a config from `{prefix}_ISSUER` and `{prefix}_AUDIENCE` env vars.
     ///
-    /// Pass an empty `prefix` for unprefixed `CHIRP_AUTH_ISSUER` / `CHIRP_AUTH_AUDIENCE`.
-    /// Returns `None` if either variable is missing or empty — the caller is
-    /// expected to treat that as "ChirpAuth not configured" rather than an error.
+    /// Pass an empty `prefix` for unprefixed `CHIRP_AUTH_ISSUER` /
+    /// `CHIRP_AUTH_AUDIENCE`. Returns `None` if either variable is missing or
+    /// empty — the caller is expected to treat that as "ChirpAuth not
+    /// configured" rather than an error.
     pub fn from_env(prefix: &str) -> Option<Self> {
         let (issuer_var, audience_var) = env_var_names(prefix);
         let issuer = std::env::var(&issuer_var)
             .ok()
-            .map(|value| value.trim().trim_end_matches('/').to_owned())
+            .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())?;
         let audience = std::env::var(&audience_var)
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())?;
-        Some(Self {
-            jwks_uri: format!("{issuer}/jwks.json"),
-            issuer,
-            audience,
-        })
+        Some(Self::new(issuer, audience))
     }
+}
+
+fn normalize_issuer(issuer: String) -> String {
+    issuer.trim().trim_end_matches('/').to_owned()
 }
 
 fn env_var_names(prefix: &str) -> (String, String) {
@@ -180,7 +263,11 @@ pub struct ChirpVerifiedToken {
 /// [`ChirpAuthError::MachineNotAllowed`] unless `accept_machine` is set.
 /// Services that want to participate in the machine-identity protocol opt in
 /// here; everyone else stays human-only with no code change.
+///
+/// `#[non_exhaustive]`: construct via `VerifyOptions { .. ..Default::default() }`
+/// so future option additions stay non-breaking.
 #[derive(Default, Clone, Debug)]
+#[non_exhaustive]
 pub struct VerifyOptions {
     /// When `true`, a human token with a missing or empty `email` claim is
     /// rejected with [`ChirpAuthError::EmailRequired`]. No effect on machine
@@ -189,10 +276,15 @@ pub struct VerifyOptions {
     /// When `true`, accept machine tokens (`act == "machine"`) in addition to
     /// human tokens. Default `false`.
     pub accept_machine: bool,
-    /// When `true`, accept tokens carrying `test == true` (minted by ChirpAuth
-    /// test deployments / test harnesses). Default `false` — production relying
-    /// parties reject test tokens with [`ChirpAuthError::TestTokenRejected`].
-    /// Only test harnesses and test deployments should set this.
+    /// Deprecated no-op, retained so 0.6 callers compile. Test-acceptance is
+    /// now derived from the configured issuer's [`Environment`]
+    /// ([`ChirpAuthConfig::environment`]), not from this flag. A
+    /// production-configured RP always rejects `test == true` tokens; a
+    /// test-configured RP always accepts them.
+    #[deprecated(
+        since = "0.7.0",
+        note = "no-op: test acceptance is derived from the configured issuer's Environment"
+    )]
     pub accept_test: bool,
 }
 
@@ -220,6 +312,17 @@ pub enum ChirpAuthError {
     MachineNotAllowed,
     #[error("machine token missing owner_sub")]
     MalformedMachineToken,
+    /// The token's provenance (production vs. test) disagrees with the
+    /// configured issuer's [`Environment`]. A production RP got a `test` token,
+    /// or a test RP got a non-`test` token.
+    #[error("token environment does not match configured issuer")]
+    EnvironmentMismatch,
+    /// No `Authorization: Bearer …` header, or an empty/whitespace token.
+    #[error("missing or empty bearer token")]
+    MissingBearer,
+    /// Retained for backward compatibility (0.6). The 0.7 environment-mismatch
+    /// path returns [`ChirpAuthError::EnvironmentMismatch`] instead.
+    #[deprecated(since = "0.7.0", note = "replaced by EnvironmentMismatch")]
     #[error("test token not accepted by this endpoint")]
     TestTokenRejected,
 }
@@ -258,10 +361,11 @@ enum AudienceClaim {
 }
 
 impl AudienceClaim {
-    fn contains(&self, expected: &str) -> bool {
+    /// True iff at least one audience value is in the allowlist.
+    fn matches_any(&self, allowed: &BTreeSet<String>) -> bool {
         match self {
-            Self::One(audience) => audience == expected,
-            Self::Many(audiences) => audiences.iter().any(|audience| audience == expected),
+            Self::One(audience) => allowed.contains(audience),
+            Self::Many(audiences) => audiences.iter().any(|a| allowed.contains(a)),
         }
     }
 
@@ -274,18 +378,21 @@ impl AudienceClaim {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct Jwks {
-    keys: Vec<Jwk>,
+/// A parsed JWKS document — the set of RSA signing keys ChirpAuth publishes.
+/// Returned by [`fetch_jwks`] for callers that need direct key access.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Jwks {
+    pub keys: Vec<Jwk>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Jwk {
-    kty: String,
-    kid: String,
-    alg: Option<String>,
-    n: String,
-    e: String,
+/// A single JWK (RSA public key) from a [`Jwks`] document.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Jwk {
+    pub kty: String,
+    pub kid: String,
+    pub alg: Option<String>,
+    pub n: String,
+    pub e: String,
 }
 
 struct JwtParts<'a> {
@@ -332,6 +439,150 @@ fn verify_rsa_signature(
         .map_err(|_| ChirpAuthError::SignatureInvalid)
 }
 
+/// Extract a bearer token from an `Authorization` header.
+///
+/// Returns the token with the `Bearer ` prefix stripped and surrounding
+/// whitespace trimmed, or `None` if the header is absent, not a `Bearer`
+/// scheme, or the token is empty after trimming. The scheme match is
+/// ASCII-case-insensitive per RFC 7235.
+pub fn bearer_token(headers: &http::HeaderMap) -> Option<&str> {
+    let value = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
+    let rest = value.strip_prefix("Bearer ").or_else(|| {
+        // Case-insensitive scheme match without allocating: split on the first
+        // space and compare the scheme.
+        let (scheme, rest) = value.split_once(' ')?;
+        scheme.eq_ignore_ascii_case("bearer").then_some(rest)
+    })?;
+    let token = rest.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Fetch and parse the JWKS document at `config.jwks_uri`.
+///
+/// Exposed so key-binding-certificate verification (and any other downstream
+/// RS256 use) can reuse one fetch+parse path instead of re-implementing it.
+pub async fn fetch_jwks(
+    client: &reqwest::Client,
+    config: &ChirpAuthConfig,
+) -> Result<Jwks, ChirpAuthError> {
+    client
+        .get(&config.jwks_uri)
+        .send()
+        .await
+        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))?
+        .error_for_status()
+        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))?
+        .json::<Jwks>()
+        .await
+        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))
+}
+
+/// A verified RS256 JWS payload — the decoded claims after signature, `iss`,
+/// `exp`, and (optionally) `aud` checks pass. Returned by
+/// [`verify_rs256_jws`].
+#[derive(Clone, Debug)]
+pub struct Claims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: Vec<String>,
+    pub exp: i64,
+    /// The raw JSON object of all claims, for callers that need claims beyond
+    /// the standard set (e.g. a key-binding cert's embedded public key).
+    pub raw: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Verify an RS256 JWS against `config`'s JWKS and standard claims.
+///
+/// This is the low-level verifier [`verify_chirp_id_token`] is built on, exposed
+/// so downstream verification of *other* ChirpAuth-signed artifacts (notably
+/// key-binding certificates) reuses one audited RS256 path rather than
+/// re-implementing JWKS fetch + signature checks.
+///
+/// Checks: RS256 alg pin (header and JWK), kid lookup in the JWKS, signature,
+/// exact `iss == config.issuer`, and `exp` in the future. When `validate_aud`
+/// is `true`, also requires at least one `aud` value in
+/// [`ChirpAuthConfig::accepted_audiences`]. Does **not** apply machine/test
+/// policy — that lives in [`verify_chirp_id_token`].
+pub async fn verify_rs256_jws(
+    client: &reqwest::Client,
+    config: &ChirpAuthConfig,
+    token: &str,
+    validate_aud: bool,
+) -> Result<Claims, ChirpAuthError> {
+    let parts = jwt_parts(token)?;
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts.header)
+        .map_err(|_| ChirpAuthError::MalformedToken)?;
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(parts.claims)
+        .map_err(|_| ChirpAuthError::MalformedToken)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(parts.signature)
+        .map_err(|_| ChirpAuthError::MalformedToken)?;
+    let header: JwtHeader = serde_json::from_slice(&header_bytes)
+        .map_err(|_| ChirpAuthError::MalformedToken)?;
+    if header.alg != "RS256" {
+        return Err(ChirpAuthError::UnsupportedAlgorithm);
+    }
+
+    let jwks = fetch_jwks(client, config).await?;
+    let key = jwks
+        .keys
+        .iter()
+        .find(|key| key.kid == header.kid && key.kty == "RSA")
+        .ok_or(ChirpAuthError::NoMatchingKey)?;
+    if key.alg.as_deref().is_some_and(|alg| alg != "RS256") {
+        return Err(ChirpAuthError::UnsupportedAlgorithm);
+    }
+    verify_rsa_signature(key, parts.signing_input.as_bytes(), &signature)?;
+
+    let raw: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&claims_bytes).map_err(|_| ChirpAuthError::MalformedToken)?;
+    let claims: ChirpClaims =
+        serde_json::from_slice(&claims_bytes).map_err(|_| ChirpAuthError::MalformedToken)?;
+
+    if claims.iss != config.issuer {
+        return Err(ChirpAuthError::ClaimMismatch);
+    }
+    if validate_aud && !claims.aud.matches_any(&config.accepted_audiences) {
+        return Err(ChirpAuthError::ClaimMismatch);
+    }
+    if claims.exp <= OffsetDateTime::now_utc().unix_timestamp() {
+        return Err(ChirpAuthError::Expired);
+    }
+
+    let aud = match &claims.aud {
+        AudienceClaim::One(a) => vec![a.clone()],
+        AudienceClaim::Many(many) => many.clone(),
+    };
+    Ok(Claims {
+        iss: claims.iss,
+        sub: claims.sub,
+        aud,
+        exp: claims.exp,
+        raw,
+    })
+}
+
+/// Extract the bearer token from `headers` and verify it in one call.
+///
+/// Convenience over [`bearer_token`] + [`verify_chirp_id_token`] so relying
+/// parties stop hand-rolling that two-step in middleware. Returns the
+/// [`ChirpVerifiedIdentity`] directly; callers needing the [`Environment`]
+/// should use the lower-level pair. [`ChirpAuthError::MissingBearer`] when no
+/// usable bearer token is present.
+pub async fn verify_from_headers(
+    client: &reqwest::Client,
+    headers: &http::HeaderMap,
+    config: &ChirpAuthConfig,
+    options: VerifyOptions,
+) -> Result<ChirpVerifiedIdentity, ChirpAuthError> {
+    let token = bearer_token(headers).ok_or(ChirpAuthError::MissingBearer)?;
+    verify_chirp_id_token(client, config, token, options)
+        .await
+        .map(|verified| verified.identity)
+}
+
 /// Verify a ChirpAuth-issued RS256 ID token end-to-end.
 ///
 /// Fetches `config.jwks_uri` each call — callers that want caching should layer
@@ -344,11 +595,11 @@ fn verify_rsa_signature(
 /// arm in practice — the verifier rejects with [`ChirpAuthError::MachineNotAllowed`]
 /// first.
 ///
-/// Tokens carrying `test == true` are rejected with
-/// [`ChirpAuthError::TestTokenRejected`] unless `options.accept_test` is set
-/// (default `false`). This is the secure default: a production relying party
-/// using [`VerifyOptions::default`] never honors a test token, even if it is
-/// otherwise valid (signature, issuer, audience, expiry all check out).
+/// **Environment is enforced** (0.7): the expected [`Environment`] is derived
+/// from `config`'s issuer, and a token whose provenance disagrees is rejected
+/// with [`ChirpAuthError::EnvironmentMismatch`]. A production RP rejects a
+/// `test == true` token; a test RP rejects a non-test token. This replaces the
+/// per-call `accept_test` flag (now a deprecated no-op).
 ///
 /// Errors are mapped granularly so the caller can decide which to surface as
 /// "401 Unauthorized" vs "500 Internal" — most consumers collapse everything
@@ -375,16 +626,7 @@ pub async fn verify_chirp_id_token(
         return Err(ChirpAuthError::UnsupportedAlgorithm);
     }
 
-    let jwks = client
-        .get(&config.jwks_uri)
-        .send()
-        .await
-        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))?
-        .error_for_status()
-        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))?
-        .json::<Jwks>()
-        .await
-        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))?;
+    let jwks = fetch_jwks(client, config).await?;
     let key = jwks
         .keys
         .iter()
@@ -397,29 +639,35 @@ pub async fn verify_chirp_id_token(
 
     let claims: ChirpClaims = serde_json::from_slice(&claims_bytes)
         .map_err(|_| ChirpAuthError::MalformedToken)?;
-    if claims.iss != config.issuer || !claims.aud.contains(&config.audience) {
+    if claims.iss != config.issuer || !claims.aud.matches_any(&config.accepted_audiences) {
         return Err(ChirpAuthError::ClaimMismatch);
     }
     if claims.exp <= OffsetDateTime::now_utc().unix_timestamp() {
         return Err(ChirpAuthError::Expired);
     }
-    // Defense-in-depth: test tokens (minted by ChirpAuth test deployments /
-    // harnesses) are rejected unless the caller explicitly opted in. This
-    // catches a production relying party that accidentally points at a test
-    // issuer or is handed a test token — it fails closed. Applies to both
-    // human and machine shapes.
-    if claims.test == Some(true) && !options.accept_test {
-        return Err(ChirpAuthError::TestTokenRejected);
+
+    // Provenance enforcement: the environment is fixed by the configured issuer
+    // (hence which keyset verified this token — `claims.iss` was just confirmed
+    // to equal `config.issuer`). The token's own `test` claim must agree:
+    //   - Production issuer  ⇒ token must NOT be `test: true`.
+    //   - Test issuer        ⇒ token MUST be `test: true`.
+    // Either disagreement fails closed. This makes the environment axis a
+    // hard boundary rather than a per-call opt-in a caller might forget.
+    let environment = config.environment();
+    let token_is_test = claims.test == Some(true);
+    let token_environment = if token_is_test {
+        Environment::Test
+    } else {
+        Environment::Production
+    };
+    if token_environment != environment {
+        return Err(ChirpAuthError::EnvironmentMismatch);
     }
+
     let sub = claims.sub.trim().to_owned();
     if sub.is_empty() || sub.chars().count() > 128 || sub.chars().any(char::is_control) {
         return Err(ChirpAuthError::InvalidSubject);
     }
-
-    // Provenance: the environment is fixed by which issuer (hence which keyset)
-    // verified this token — `claims.iss` was just confirmed to equal
-    // `config.issuer`. A prod-issuer RP can only ever yield `Production` here.
-    let environment = Environment::from_issuer(&config.issuer);
 
     let is_machine = matches!(claims.act.as_deref(), Some("machine"));
     if is_machine {
@@ -487,9 +735,9 @@ mod tests {
             std::env::set_var(format!("{prefix}_AUDIENCE"), "drive");
         }
         let config = ChirpAuthConfig::from_env(prefix).expect("config");
-        assert_eq!(config.issuer, "https://example.test");
-        assert_eq!(config.audience, "drive");
-        assert_eq!(config.jwks_uri, "https://example.test/jwks.json");
+        assert_eq!(config.issuer(), "https://example.test");
+        assert!(config.accepted_audiences().contains("drive"));
+        assert_eq!(config.jwks_uri(), "https://example.test/jwks.json");
         unsafe {
             std::env::remove_var(format!("{prefix}_ISSUER"));
             std::env::remove_var(format!("{prefix}_AUDIENCE"));
@@ -521,13 +769,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn new_derives_jwks_uri_and_normalizes_issuer() {
+        let config = ChirpAuthConfig::new("https://signin.chirpauth.com/", "drive");
+        assert_eq!(config.issuer(), "https://signin.chirpauth.com");
+        assert_eq!(config.jwks_uri(), "https://signin.chirpauth.com/jwks.json");
+        assert_eq!(config.environment(), Environment::Production);
+    }
+
+    #[test]
+    fn default_issuer_is_production_environment() {
+        let config = ChirpAuthConfig::new(DEFAULT_ISSUER, "drive");
+        assert_eq!(config.environment(), Environment::Production);
+        assert_eq!(config.issuer(), "https://signin.chirpauth.com");
+    }
+
+    #[test]
+    fn with_audiences_builds_allowlist() {
+        let config = ChirpAuthConfig::with_audiences(
+            DEFAULT_ISSUER,
+            ["a".to_owned(), "b".to_owned(), "c".to_owned()],
+        );
+        assert!(config.accepted_audiences().contains("a"));
+        assert!(config.accepted_audiences().contains("b"));
+        assert!(config.accepted_audiences().contains("c"));
+        assert!(!config.accepted_audiences().contains("d"));
+    }
+
+    #[test]
+    fn add_audience_extends_allowlist() {
+        let config = ChirpAuthConfig::new(DEFAULT_ISSUER, "a").add_audience("b");
+        assert!(config.accepted_audiences().contains("a"));
+        assert!(config.accepted_audiences().contains("b"));
+    }
+
     #[tokio::test]
     async fn rejects_malformed_token() {
-        let config = ChirpAuthConfig {
-            issuer: "https://example.test".into(),
-            audience: "drive".into(),
-            jwks_uri: "https://example.test/jwks.json".into(),
-        };
+        let config = ChirpAuthConfig::new("https://example.test", "drive")
+            .with_jwks_uri("https://example.test/jwks.json");
         let client = reqwest::Client::new();
         let err = verify_chirp_id_token(&client, &config, "not.a.jwt.too.many", VerifyOptions::default())
             .await
@@ -537,11 +816,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_two_segment_token() {
-        let config = ChirpAuthConfig {
-            issuer: "https://example.test".into(),
-            audience: "drive".into(),
-            jwks_uri: "https://example.test/jwks.json".into(),
-        };
+        let config = ChirpAuthConfig::new("https://example.test", "drive")
+            .with_jwks_uri("https://example.test/jwks.json");
         let client = reqwest::Client::new();
         let err = verify_chirp_id_token(&client, &config, "abc.def", VerifyOptions::default())
             .await
@@ -577,26 +853,19 @@ mod tests {
 
     #[test]
     fn chirp_claims_parses_test_flag_when_present_and_absent() {
-        // Absent → None, which the verifier treats as "not a test token".
+        // Absent → None, which the verifier treats as production provenance.
         let absent: ChirpClaims = serde_json::from_str(
             r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1}"#,
         )
         .expect("parse");
         assert_eq!(absent.test, None);
 
-        // Present and true → the value the verifier gates rejection on.
+        // Present and true → the value the verifier gates environment on.
         let present: ChirpClaims = serde_json::from_str(
             r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1,"test":true}"#,
         )
         .expect("parse");
         assert_eq!(present.test, Some(true));
-    }
-
-    #[test]
-    fn verify_options_default_rejects_test_tokens() {
-        // The whole point of the secure default: a caller doing
-        // VerifyOptions::default() must NOT be opted into test tokens.
-        assert!(!VerifyOptions::default().accept_test);
     }
 
     #[test]
@@ -615,6 +884,60 @@ mod tests {
         };
         assert_eq!(machine.sub(), "agent_xyz");
     }
+
+    // -------------------- bearer extraction --------------------
+
+    fn headers_with_auth(value: &str) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn bearer_token_strips_prefix_and_trims() {
+        let h = headers_with_auth("Bearer   abc.def.ghi  ");
+        assert_eq!(bearer_token(&h), Some("abc.def.ghi"));
+    }
+
+    #[test]
+    fn bearer_token_case_insensitive_scheme() {
+        let h = headers_with_auth("bearer tok123");
+        assert_eq!(bearer_token(&h), Some("tok123"));
+        let h = headers_with_auth("BEARER tok456");
+        assert_eq!(bearer_token(&h), Some("tok456"));
+    }
+
+    #[test]
+    fn bearer_token_rejects_empty_after_prefix() {
+        let h = headers_with_auth("Bearer    ");
+        assert_eq!(bearer_token(&h), None);
+        let h = headers_with_auth("Bearer ");
+        assert_eq!(bearer_token(&h), None);
+    }
+
+    #[test]
+    fn bearer_token_rejects_other_schemes() {
+        let h = headers_with_auth("Basic dXNlcjpwYXNz");
+        assert_eq!(bearer_token(&h), None);
+        let h = headers_with_auth("Token abc");
+        assert_eq!(bearer_token(&h), None);
+    }
+
+    #[test]
+    fn bearer_token_none_when_header_absent() {
+        let h = http::HeaderMap::new();
+        assert_eq!(bearer_token(&h), None);
+    }
+
+    #[test]
+    fn bearer_token_rejects_bare_scheme_word() {
+        // "Bearer" with no space/value is not a valid bearer credential.
+        let h = headers_with_auth("Bearer");
+        assert_eq!(bearer_token(&h), None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,8 +948,9 @@ mod tests {
 // stand up an in-process JWKS server, mint real RS256 tokens against a
 // generated keypair, and assert the verifier behaves correctly on the full
 // path: signature, kid lookup, algorithm pin, issuer/audience claim, expiry,
-// machine-token gating, and a handful of adversarial constructions (alg=none,
-// alg-confusion via RS512, kid not in JWKS, issuer-suffix attack).
+// machine-token gating, environment enforcement, and a handful of adversarial
+// constructions (alg=none, alg-confusion via RS512, kid not in JWKS,
+// issuer-suffix attack).
 //
 // One RSA-2048 keypair is generated lazily and shared across tests via
 // `OnceLock` — RSA keygen is the slow part (~200ms); reusing the key keeps
@@ -740,12 +1064,11 @@ mod verify_path_tests {
         format!(r#"{{"alg":"RS256","typ":"JWT","kid":"{KID}"}}"#)
     }
 
+    /// A production-issuer config whose JWKS fetch is pointed at the in-process
+    /// server. The issuer (`ISS`) has no `/test/{tenant}` suffix, so its
+    /// `environment()` is `Production`.
     fn config_pointing_at(jwks_uri: String) -> ChirpAuthConfig {
-        ChirpAuthConfig {
-            issuer: ISS.into(),
-            audience: AUD.into(),
-            jwks_uri,
-        }
+        ChirpAuthConfig::new(ISS, AUD).with_jwks_uri(jwks_uri)
     }
 
     // -------------------- happy path --------------------
@@ -964,6 +1287,177 @@ mod verify_path_tests {
         assert!(matches!(err, ChirpAuthError::MachineNotAllowed), "got {err:?}");
     }
 
+    // -------------------- audience allowlist --------------------
+
+    /// A config carrying several accepted audiences must accept a token whose
+    /// single `aud` is any one of them — in one pass, no per-audience loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allowlist_accepts_any_listed_audience() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let config = ChirpAuthConfig::with_audiences(
+            ISS,
+            ["cs_one".to_owned(), AUD.to_owned(), "cs_three".to_owned()],
+        )
+        .with_jwks_uri(jwks);
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        let verified = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config,
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .expect("verify");
+        assert!(matches!(verified.identity, ChirpVerifiedIdentity::Human { .. }));
+    }
+
+    /// A token whose `aud` is NOT in the allowlist is rejected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allowlist_rejects_unlisted_audience() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let config = ChirpAuthConfig::with_audiences(
+            ISS,
+            ["cs_one".to_owned(), "cs_two".to_owned()],
+        )
+        .with_jwks_uri(jwks);
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config,
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::ClaimMismatch), "got {err:?}");
+    }
+
+    /// A multi-valued `aud` array is accepted when any one value is allowed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allowlist_accepts_multivalued_aud_intersection() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let config = ChirpAuthConfig::new(ISS, AUD).with_jwks_uri(jwks);
+        let exp = now_unix() + 3600;
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"sub_test","aud":["cs_other","{AUD}"],"exp":{exp},"email":"u@example.test"}}"#
+        );
+        let token = make_signed_jwt(&good_header(), &claims);
+        let verified = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config,
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .expect("verify");
+        assert!(matches!(verified.identity, ChirpVerifiedIdentity::Human { .. }));
+    }
+
+    // -------------------- verify_from_headers --------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_from_headers_extracts_and_verifies() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let identity = verify_from_headers(
+            &reqwest::Client::new(),
+            &headers,
+            &config_pointing_at(jwks),
+            VerifyOptions::default(),
+        )
+        .await
+        .expect("verify");
+        assert!(matches!(identity, ChirpVerifiedIdentity::Human { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_from_headers_missing_bearer() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let headers = http::HeaderMap::new();
+        let err = verify_from_headers(
+            &reqwest::Client::new(),
+            &headers,
+            &config_pointing_at(jwks),
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::MissingBearer), "got {err:?}");
+    }
+
+    // -------------------- verify_rs256_jws (low-level) --------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_rs256_jws_returns_claims_and_raw() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let config = config_pointing_at(jwks);
+        let exp = now_unix() + 3600;
+        // A key-binding-cert-shaped payload: standard claims plus an extra
+        // field the high-level verifier doesn't model.
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"sub_test","aud":"{AUD}","exp":{exp},"bound_pubkey":"ed25519:abc"}}"#
+        );
+        let token = make_signed_jwt(&good_header(), &claims);
+        let verified = verify_rs256_jws(&reqwest::Client::new(), &config, &token, true)
+            .await
+            .expect("verify");
+        assert_eq!(verified.sub, "sub_test");
+        assert_eq!(verified.aud, vec![AUD.to_owned()]);
+        assert_eq!(
+            verified.raw.get("bound_pubkey").and_then(|v| v.as_str()),
+            Some("ed25519:abc")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_rs256_jws_skips_aud_when_not_validating() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let config = config_pointing_at(jwks);
+        let exp = now_unix() + 3600;
+        // aud not in allowlist — accepted because validate_aud = false.
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"sub_test","aud":"cs_unrelated","exp":{exp}}}"#
+        );
+        let token = make_signed_jwt(&good_header(), &claims);
+        let verified = verify_rs256_jws(&reqwest::Client::new(), &config, &token, false)
+            .await
+            .expect("verify without aud validation");
+        assert_eq!(verified.sub, "sub_test");
+    }
+
+    /// Machine tokens are rejected by default. (kept as a paired inverse below)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_machine_token_when_accept_machine_true() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let exp = now_unix() + 3600;
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"agent_test","aud":"{AUD}","exp":{exp},"act":"machine","owner_sub":"sub_owner"}}"#
+        );
+        let token = make_signed_jwt(&good_header(), &claims);
+        let identity = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions { require_email: false, accept_machine: true, ..Default::default() },
+        )
+        .await
+        .expect("verify machine");
+        assert_eq!(identity.environment, Environment::Production);
+        match identity.identity {
+            ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => {
+                assert_eq!(sub, "agent_test");
+                assert_eq!(owner_sub, "sub_owner");
+                assert_eq!(client_id, AUD);
+            }
+            _ => panic!("expected Machine"),
+        }
+    }
+
     // -------------------- consumer-profile contract tests --------------
     //
     // Three downstream services consume this crate and each calls
@@ -972,17 +1466,6 @@ mod verify_path_tests {
     //   Drive        → { accept_machine: true,  require_email: false }
     //   Pigeon       → { accept_machine: true,  require_email: false }
     //   Social Graph → { accept_machine: false, require_email: true  }
-    //
-    // The tests below pin each profile's accept/reject behavior over the
-    // same set of minted tokens. If chirp-auth-client's interpretation
-    // of any option drifts, exactly one of these tests fails and points
-    // at the affected profile.
-    //
-    // What they CANNOT catch: a consumer changing its own auth.rs to
-    // pass different options. For that we'd need a cross-repo
-    // integration test. These tests serve as the canonical reference
-    // for what each profile SHOULD do — operators reviewing a
-    // consumer's auth.rs should grep here first.
 
     fn drive_profile() -> VerifyOptions {
         VerifyOptions { accept_machine: true, require_email: false, ..Default::default() }
@@ -1048,10 +1531,6 @@ mod verify_path_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pigeon_profile_matches_drive_profile() {
-        // Pigeon and Drive both use {accept_machine: true,
-        // require_email: false}. Any future divergence (e.g. Pigeon
-        // tightens to require_email = true) should land here as an
-        // explicit edit, not as silent drift.
         assert_eq!(
             (drive_profile().accept_machine, drive_profile().require_email),
             (pigeon_profile().accept_machine, pigeon_profile().require_email),
@@ -1080,41 +1559,11 @@ mod verify_path_tests {
         assert!(matches!(err, ChirpAuthError::MachineNotAllowed), "got {err:?}");
     }
 
-    /// Inverse: machine token IS accepted when opted in, and the Machine
-    /// variant carries through.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn accepts_machine_token_when_accept_machine_true() {
-        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
-        let exp = now_unix() + 3600;
-        let claims = format!(
-            r#"{{"iss":"{ISS}","sub":"agent_test","aud":"{AUD}","exp":{exp},"act":"machine","owner_sub":"sub_owner"}}"#
-        );
-        let token = make_signed_jwt(&good_header(), &claims);
-        let identity = verify_chirp_id_token(
-            &reqwest::Client::new(),
-            &config_pointing_at(jwks),
-            &token,
-            VerifyOptions { require_email: false, accept_machine: true, ..Default::default() },
-        )
-        .await
-        .expect("verify machine");
-        assert_eq!(identity.environment, Environment::Production);
-        match identity.identity {
-            ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => {
-                assert_eq!(sub, "agent_test");
-                assert_eq!(owner_sub, "sub_owner");
-                assert_eq!(client_id, AUD);
-            }
-            _ => panic!("expected Machine"),
-        }
-    }
-
-    // -------------------- test-token gating --------------------
+    // -------------------- environment enforcement --------------------
     //
-    // ChirpAuth test deployments mint tokens with `test: true`. A production
-    // relying party using the default options must reject them even though
-    // they are otherwise fully valid (real signature, matching iss/aud, not
-    // expired). Test harnesses opt in with accept_test: true.
+    // The environment axis is now enforced. A production-configured RP must
+    // reject a `test: true` token; a test-configured RP must reject a
+    // non-test token. Both fail with EnvironmentMismatch.
 
     fn human_test_claims(iss: &str, aud: &str, exp: i64) -> String {
         format!(
@@ -1122,8 +1571,37 @@ mod verify_path_tests {
         )
     }
 
+    /// A test issuer config (`…/test/{tenant}`). The JWKS is the same
+    /// in-process server (in production the test keyset is disjoint, but for
+    /// the verify-path test what matters is the issuer string the config and
+    /// token agree on).
+    fn test_issuer_config(jwks_uri: String) -> (ChirpAuthConfig, String) {
+        let test_iss = format!("{ISS}/test/acme");
+        let config = ChirpAuthConfig::new(&test_iss, AUD).with_jwks_uri(jwks_uri);
+        (config, test_iss)
+    }
+
+    /// Production RP + production (non-test) token → accepted.
     #[tokio::test(flavor = "multi_thread")]
-    async fn rejects_test_token_by_default() {
+    async fn prod_rp_accepts_prod_token() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        let verified = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .expect("verify");
+        assert_eq!(verified.environment, Environment::Production);
+    }
+
+    /// Production RP + test token → rejected with EnvironmentMismatch. This is
+    /// the core enforcement: a production relying party can never honor a token
+    /// minted by a test deployment, even with a valid signature/iss/aud/exp.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prod_rp_rejects_test_token() {
         let jwks = start_jwks_server(jwks_body_with_test_key()).await;
         let token = make_signed_jwt(&good_header(), &human_test_claims(ISS, AUD, now_unix() + 3600));
         let err = verify_chirp_id_token(
@@ -1134,29 +1612,49 @@ mod verify_path_tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, ChirpAuthError::TestTokenRejected), "got {err:?}");
+        assert!(matches!(err, ChirpAuthError::EnvironmentMismatch), "got {err:?}");
     }
 
+    /// Test RP + test token → accepted, and reported as Environment::Test.
     #[tokio::test(flavor = "multi_thread")]
-    async fn accepts_test_token_when_accept_test_true() {
+    async fn test_rp_accepts_test_token() {
         let jwks = start_jwks_server(jwks_body_with_test_key()).await;
-        let token = make_signed_jwt(&good_header(), &human_test_claims(ISS, AUD, now_unix() + 3600));
-        let identity = verify_chirp_id_token(
+        let (config, test_iss) = test_issuer_config(jwks);
+        let token =
+            make_signed_jwt(&good_header(), &human_test_claims(&test_iss, AUD, now_unix() + 3600));
+        let verified = verify_chirp_id_token(
             &reqwest::Client::new(),
-            &config_pointing_at(jwks),
+            &config,
             &token,
-            VerifyOptions { accept_test: true, ..Default::default() },
+            VerifyOptions::default(),
         )
         .await
-        .expect("verify test token");
-        match identity.identity {
-            ChirpVerifiedIdentity::Human { sub, .. } => assert_eq!(sub, "sub_test"),
-            _ => panic!("expected Human"),
-        }
+        .expect("verify test token under test RP");
+        assert_eq!(verified.environment, Environment::Test);
+        assert!(matches!(verified.identity, ChirpVerifiedIdentity::Human { .. }));
     }
 
-    /// A non-test token must still be accepted under the default options —
-    /// the new gate only fires on `test == true`, never on its absence.
+    /// Test RP + non-test token → rejected. The symmetric direction: a test
+    /// deployment must not honor a production-shaped token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rp_rejects_non_test_token() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let (config, test_iss) = test_issuer_config(jwks);
+        // Non-test claims (no `test: true`) but with the test issuer.
+        let token = make_signed_jwt(&good_header(), &good_claims(&test_iss, AUD, now_unix() + 3600));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config,
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::EnvironmentMismatch), "got {err:?}");
+    }
+
+    /// A non-test token must still be accepted under the default options by a
+    /// production RP — the environment gate only fires on disagreement.
     #[tokio::test(flavor = "multi_thread")]
     async fn accepts_non_test_token_by_default() {
         let jwks = start_jwks_server(jwks_body_with_test_key()).await;
@@ -1172,8 +1670,6 @@ mod verify_path_tests {
         assert!(matches!(identity.identity, ChirpVerifiedIdentity::Human { .. }));
     }
 
-    // -------------------- environment (provenance) axis --------------------
-
     #[test]
     fn environment_from_issuer_classifies_provenance() {
         use Environment::{Production, Test};
@@ -1186,30 +1682,5 @@ mod verify_path_tests {
         // empty tenant, and a host merely named "test", are production
         assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/"), Production);
         assert_eq!(Environment::from_issuer("https://test.example.com"), Production);
-    }
-
-    /// Provenance end-to-end: a token verified against a `/test/{tenant}` issuer
-    /// is reported as `Environment::Test` — derived from which issuer/keyset
-    /// matched, not from any claim in the token.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_issuer_yields_environment_test() {
-        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
-        let test_iss = format!("{ISS}/test/acme");
-        let token = make_signed_jwt(&good_header(), &good_claims(&test_iss, AUD, now_unix() + 3600));
-        let config = ChirpAuthConfig {
-            issuer: test_iss,
-            audience: AUD.into(),
-            jwks_uri: jwks,
-        };
-        let verified = verify_chirp_id_token(
-            &reqwest::Client::new(),
-            &config,
-            &token,
-            VerifyOptions::default(),
-        )
-        .await
-        .expect("verify test-issuer token");
-        assert_eq!(verified.environment, Environment::Test);
-        assert!(matches!(verified.identity, ChirpVerifiedIdentity::Human { .. }));
     }
 }

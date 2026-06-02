@@ -14,32 +14,50 @@ A Rust client for verifying ID tokens issued by [ChirpAuth](https://signin.chirp
 
 ```rust
 use chirp_auth_client::{
-    ChirpAuthConfig, ChirpVerifiedIdentity, VerifyOptions, verify_chirp_id_token,
+    ChirpAuthConfig, ChirpVerifiedIdentity, DEFAULT_ISSUER, VerifyOptions,
+    verify_from_headers,
 };
 
-let config = ChirpAuthConfig {
-    issuer: "https://signin.chirpauth.com".to_string(),
-    audience: "cs_live_your_client_id".to_string(),
-    jwks_uri: "https://signin.chirpauth.com/jwks.json".to_string(),
-};
+// jwks_uri is derived as `{issuer}/jwks.json` — it cannot be hand-set wrong.
+let config = ChirpAuthConfig::new(DEFAULT_ISSUER, "cs_live_your_client_id");
 let http_client = reqwest::Client::new();
-let identity = verify_chirp_id_token(
+
+// Extract `Authorization: Bearer …` and verify in one call.
+let identity = verify_from_headers(
     &http_client,
+    request_headers,
     &config,
-    presented_jwt,
-    VerifyOptions { require_email: true, accept_machine: false },
+    VerifyOptions { require_email: true, ..Default::default() },
 )
 .await?;
 
 match identity {
-    ChirpVerifiedIdentity::Human { sub, email, name } => { /* ... */ }
+    ChirpVerifiedIdentity::Human { sub, email, name, root_sub } => { /* ... */ }
     ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => { /* ... */ }
 }
 ```
 
-`ChirpAuthConfig::from_env(prefix)` is also available for the common case of
-reading `{PREFIX}_ISSUER` / `{PREFIX}_AUDIENCE` from the environment (pass an
-empty prefix for unprefixed `CHIRP_AUTH_*`).
+`ChirpAuthConfig::with_audiences(issuer, audiences)` builds an audience
+allowlist (a token is accepted if any of its `aud` values is in the set, checked
+in one pass). `ChirpAuthConfig::from_env(prefix)` reads
+`{PREFIX}_ISSUER` / `{PREFIX}_AUDIENCE` from the environment (empty prefix for
+unprefixed `CHIRP_AUTH_*`).
+
+### Environment enforcement
+
+The verifier derives the expected `Environment` (`Production`/`Test`) from the
+configured issuer and **rejects** a token whose provenance disagrees: a
+production-configured relying party rejects a test-issuer (`test: true`) token,
+and a test-configured RP (issuer `…/test/{tenant}`) rejects a non-test token,
+both with `ChirpAuthError::EnvironmentMismatch`. Test-acceptance is no longer a
+per-call flag (`VerifyOptions::accept_test` is a deprecated no-op).
+
+### Lower-level surface
+
+- `bearer_token(&HeaderMap) -> Option<&str>` — strip/validate a bearer token.
+- `fetch_jwks(...)` + `verify_rs256_jws(config, token, validate_aud)` — reuse the
+  audited RS256 verifier for other ChirpAuth-signed artifacts (e.g. key-binding
+  certificates) instead of re-implementing JWKS fetch and signature checks.
 
 ## Testing
 
@@ -47,10 +65,13 @@ empty prefix for unprefixed `CHIRP_AUTH_*`).
 cargo test
 ```
 
-26 tests cover the end-to-end verify path (signed-by-test-keypair tokens
-against an in-process JWKS server) plus consumer-profile contract tests
-that pin the `VerifyOptions` shapes Drive, Pigeon, and Social Graph each
-use. CI runs the suite on every push and PR.
+Tests cover the end-to-end verify path (signed-by-test-keypair tokens against
+an in-process JWKS server): signature, kid lookup, algorithm pin, issuer/audience
+claim, expiry, machine-token gating, environment enforcement (prod-RP-rejects-test
+and test-RP-rejects-prod), the audience allowlist, bearer extraction, and
+adversarial constructions — plus consumer-profile contract tests that pin the
+`VerifyOptions` shapes Drive, Pigeon, and Social Graph each use. CI runs the
+suite on every push and PR.
 
 ## License
 
