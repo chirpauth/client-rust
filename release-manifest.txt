@@ -1,0 +1,10 @@
+# Release allowlist for the chirpauth/client-rust git mirror (deny-by-default).
+# Note: crates.io content is governed separately by Cargo's include/exclude
+# (verified in CI via `cargo package --list`). This list is only the git mirror.
+Cargo.toml
+Cargo.lock
+src
+README.md
+LICENSE-MIT
+LICENSE-APACHE
+# Excluded: .github/ (dev CI incl. this workflow), target/, .claude/, tests/fixtures-dev, etc.

@@ -1,0 +1,70 @@
+# Publish a release of the ChirpAuth Rust client.
+#
+# The canonical distribution for a Rust library is crates.io (immutable,
+# checksummed, with a precise file allowlist via Cargo's include/exclude).
+# chirpauth/client-rust is a SECONDARY source-availability mirror.
+#
+# Same deny-by-default gates as the server: runs only on a vX.Y.Z tag (or
+# dispatch); tests must pass; crates.io ships exactly `cargo package` (verified
+# below); the git mirror gets only the allowlisted tree as one clean commit.
+name: publish release → crates.io + chirpauth/client-rust
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "tag or sha to publish"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency: publish-client-release
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Gate — tests must pass
+        run: cargo test --locked
+
+      - name: Show exactly what crates.io will receive (allowlist = Cargo include/exclude)
+        run: cargo package --locked --list
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Mirror clean snapshot → chirpauth/client-rust
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -f release-manifest.txt
+          SRC_SHA="$(git rev-parse HEAD)"
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.ref }}}"
+          rm -rf "$RUNNER_TEMP/rel" && mkdir -p "$RUNNER_TEMP/rel"
+          grep -vE '^[[:space:]]*(#|$)' release-manifest.txt | while IFS= read -r p; do
+            if [ ! -e "$p" ]; then echo "::error::manifest path not found: $p"; exit 1; fi
+            mkdir -p "$RUNNER_TEMP/rel/$(dirname "$p")"
+            cp -a "$p" "$RUNNER_TEMP/rel/$p"
+          done
+          git clone --depth 1 "https://x-access-token:${MIRROR_TOKEN}@github.com/chirpauth/client-rust.git" "$RUNNER_TEMP/mirror"
+          cd "$RUNNER_TEMP/mirror"
+          git ls-files -z | xargs -0 -r rm -f
+          cp -a "$RUNNER_TEMP/rel/." .
+          git config user.name  "chirpauth-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Release ${VERSION} (source: client-rust-dev@${SRC_SHA})"
+          git tag -f "${VERSION}"
+          git push origin HEAD:main
+          git push -f origin "${VERSION}"
