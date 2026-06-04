@@ -43,9 +43,18 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
 
+      - name: Mint a short-lived install token scoped to chirpauth/client-rust only
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: chirpauth
+          repositories: client-rust
+
       - name: Mirror clean snapshot → chirpauth/client-rust
         env:
-          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+          MIRROR_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           set -euo pipefail
           test -f release-manifest.txt
