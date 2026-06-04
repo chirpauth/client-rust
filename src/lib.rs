@@ -1683,4 +1683,78 @@ mod verify_path_tests {
         assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/"), Production);
         assert_eq!(Environment::from_issuer("https://test.example.com"), Production);
     }
+
+    // -------------------- environment enforcement, quantified --------------
+    //
+    // Property P1 — environment/keyset soundness on the verifier side. The four
+    // hand-written direction tests above spot-check the prod/test × prod/test
+    // matrix with one issuer each. This quantifies the same enforcement over an
+    // arbitrary tenant id AND both axes at once: with signature, iss, aud, and
+    // exp all valid in every case (so the environment axis is isolated), the
+    // verifier accepts IFF the issuer-derived environment matches the token's
+    // `test` provenance. A test token can never be honored by a production RP,
+    // and vice-versa, no matter how the tenant is spelled.
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        #[test]
+        fn env_enforced_accept_iff_environments_match(
+            tenant in "[a-z0-9]{1,16}",
+            use_test_issuer in any::<bool>(),
+            token_is_test in any::<bool>(),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async {
+                let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+                let issuer = if use_test_issuer {
+                    format!("{ISS}/test/{tenant}")
+                } else {
+                    ISS.to_string()
+                };
+                let config = ChirpAuthConfig::new(&issuer, AUD).with_jwks_uri(jwks);
+                let expected_env = if use_test_issuer {
+                    Environment::Test
+                } else {
+                    Environment::Production
+                };
+                let token_env = if token_is_test {
+                    Environment::Test
+                } else {
+                    Environment::Production
+                };
+
+                let test_field = if token_is_test { r#","test":true"# } else { "" };
+                let claims = format!(
+                    r#"{{"iss":"{issuer}","sub":"sub_p","aud":"{AUD}","exp":{}{test_field}}}"#,
+                    now_unix() + 3600,
+                );
+                let token = make_signed_jwt(&good_header(), &claims);
+                let result = verify_chirp_id_token(
+                    &reqwest::Client::new(),
+                    &config,
+                    &token,
+                    VerifyOptions::default(),
+                )
+                .await;
+
+                let should_accept = expected_env == token_env;
+                prop_assert_eq!(
+                    result.is_ok(),
+                    should_accept,
+                    "issuer={} token_is_test={}",
+                    issuer,
+                    token_is_test
+                );
+                if let Ok(verified) = result {
+                    prop_assert_eq!(verified.environment, expected_env);
+                }
+                Ok(())
+            })?;
+        }
+    }
 }
