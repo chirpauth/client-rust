@@ -35,13 +35,18 @@ jobs:
       - name: Gate — tests must pass
         run: cargo test --locked
 
-      - name: Show exactly what crates.io will receive (allowlist = Cargo include/exclude)
+      - name: Dry-run — show exactly what a crates.io publish would ship
         run: cargo package --locked --list
 
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+      # crates.io publishing is intentionally DISABLED for now (git mirror only).
+      # To enable: (1) set the CARGO_REGISTRY_TOKEN secret on this repo
+      # (crates.io API token, publish scope), then (2) uncomment the step below.
+      # NOTE: the first publish claims `chirp-auth-client` on crates.io publicly
+      # and is irreversible — a deliberate decision, not an accident.
+      # - name: Publish to crates.io
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      #   run: cargo publish --locked
 
       - name: Mint a short-lived install token scoped to chirpauth/client-rust only
         id: token
