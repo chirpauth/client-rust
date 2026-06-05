@@ -46,6 +46,8 @@
 //! a per-call flag. The old [`VerifyOptions::accept_test`] field is retained as
 //! a deprecated no-op so 0.6 callers still compile; it no longer affects policy.
 
+pub mod mint;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, RsaPublicKeyComponents};
