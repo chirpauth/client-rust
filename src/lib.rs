@@ -190,7 +190,11 @@ fn env_var_names(prefix: &str) -> (String, String) {
 pub enum ChirpVerifiedIdentity {
     Human {
         sub: String,
-        email: Option<String>,
+        // NOTE: there is intentionally NO `email` field. ChirpAuth never hands a
+        // relying party a user's email address — it is structurally absent from
+        // the verified identity, so an app cannot read it even in principle.
+        // ChirpAuth holds the address to send magic links / route mediated
+        // contact. See chirp-auth docs/mediated-contact-north-star.md.
         name: Option<String>,
         /// The root identity behind `sub`. For single-persona users
         /// (the only case ChirpAuth issues today) equals `sub`. When
@@ -271,10 +275,6 @@ pub struct ChirpVerifiedToken {
 #[derive(Default, Clone, Debug)]
 #[non_exhaustive]
 pub struct VerifyOptions {
-    /// When `true`, a human token with a missing or empty `email` claim is
-    /// rejected with [`ChirpAuthError::EmailRequired`]. No effect on machine
-    /// tokens (which never carry `email`).
-    pub require_email: bool,
     /// When `true`, accept machine tokens (`act == "machine"`) in addition to
     /// human tokens. Default `false`.
     pub accept_machine: bool,
@@ -308,8 +308,6 @@ pub enum ChirpAuthError {
     Expired,
     #[error("invalid subject")]
     InvalidSubject,
-    #[error("email claim required but missing")]
-    EmailRequired,
     #[error("machine token not accepted by this endpoint")]
     MachineNotAllowed,
     #[error("machine token missing owner_sub")]
@@ -345,8 +343,6 @@ struct ChirpClaims {
     act: Option<String>,
     #[serde(default)]
     owner_sub: Option<String>,
-    #[serde(default)]
-    email: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -698,17 +694,10 @@ pub async fn verify_chirp_id_token(
         });
     }
 
-    let email = claims
-        .email
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
     let name = claims
         .name
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    if options.require_email && email.is_none() {
-        return Err(ChirpAuthError::EmailRequired);
-    }
     // Backward-compat default: tokens minted before the `root_sub` claim
     // existed have a single-persona identity by construction, so the
     // root identity is the sub itself.
@@ -719,7 +708,7 @@ pub async fn verify_chirp_id_token(
         .unwrap_or_else(|| sub.clone());
     Ok(ChirpVerifiedToken {
         environment,
-        identity: ChirpVerifiedIdentity::Human { sub, email, name, root_sub },
+        identity: ChirpVerifiedIdentity::Human { sub, name, root_sub },
     })
 }
 
@@ -874,7 +863,6 @@ mod tests {
     fn identity_sub_returns_underlying_sub() {
         let human = ChirpVerifiedIdentity::Human {
             sub: "sub_abc".into(),
-            email: None,
             name: None,
             root_sub: "sub_abc".into(),
         };
@@ -1089,9 +1077,8 @@ mod verify_path_tests {
         .expect("verify");
         assert_eq!(identity.environment, Environment::Production);
         match identity.identity {
-            ChirpVerifiedIdentity::Human { sub, email, .. } => {
+            ChirpVerifiedIdentity::Human { sub, .. } => {
                 assert_eq!(sub, "sub_test");
-                assert_eq!(email.as_deref(), Some("u@example.test"));
             }
             _ => panic!("expected Human"),
         }
@@ -1445,7 +1432,7 @@ mod verify_path_tests {
             &reqwest::Client::new(),
             &config_pointing_at(jwks),
             &token,
-            VerifyOptions { require_email: false, accept_machine: true, ..Default::default() },
+            VerifyOptions { accept_machine: true, ..Default::default() },
         )
         .await
         .expect("verify machine");
@@ -1465,18 +1452,19 @@ mod verify_path_tests {
     // Three downstream services consume this crate and each calls
     // verify_chirp_id_token with a different VerifyOptions config:
     //
-    //   Drive        → { accept_machine: true,  require_email: false }
-    //   Pigeon       → { accept_machine: true,  require_email: false }
-    //   Social Graph → { accept_machine: false, require_email: true  }
+    //   Drive        → { accept_machine: true  }
+    //   Pigeon       → { accept_machine: true  }
+    //   Social Graph → { accept_machine: false }
+    // There is no email axis — email is never in a token or the verified identity.
 
     fn drive_profile() -> VerifyOptions {
-        VerifyOptions { accept_machine: true, require_email: false, ..Default::default() }
+        VerifyOptions { accept_machine: true, ..Default::default() }
     }
     fn pigeon_profile() -> VerifyOptions {
-        VerifyOptions { accept_machine: true, require_email: false, ..Default::default() }
+        VerifyOptions { accept_machine: true, ..Default::default() }
     }
     fn social_graph_profile() -> VerifyOptions {
-        VerifyOptions { accept_machine: false, require_email: true, ..Default::default() }
+        VerifyOptions { accept_machine: false, ..Default::default() }
     }
 
     fn human_claims_with_email(iss: &str, aud: &str, exp: i64) -> String {
@@ -1520,7 +1508,7 @@ mod verify_path_tests {
     async fn drive_profile_accepts_human_without_email() {
         let claims = human_claims_without_email(ISS, AUD, now_unix() + 3600);
         let id = run(drive_profile(), &claims).await.expect("accept");
-        assert!(matches!(id, ChirpVerifiedIdentity::Human { email: None, .. }));
+        assert!(matches!(id, ChirpVerifiedIdentity::Human { .. }));
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn drive_profile_accepts_machine_token() {
@@ -1534,8 +1522,8 @@ mod verify_path_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pigeon_profile_matches_drive_profile() {
         assert_eq!(
-            (drive_profile().accept_machine, drive_profile().require_email),
-            (pigeon_profile().accept_machine, pigeon_profile().require_email),
+            drive_profile().accept_machine,
+            pigeon_profile().accept_machine,
             "Drive and Pigeon profiles diverged. Update this test if intentional.",
         );
     }
@@ -1543,16 +1531,11 @@ mod verify_path_tests {
     // -- Social Graph profile ------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn social_graph_profile_accepts_human_with_email() {
-        let claims = human_claims_with_email(ISS, AUD, now_unix() + 3600);
-        let id = run(social_graph_profile(), &claims).await.expect("accept");
-        assert!(matches!(id, ChirpVerifiedIdentity::Human { email: Some(_), .. }));
-    }
-    #[tokio::test(flavor = "multi_thread")]
-    async fn social_graph_profile_rejects_human_without_email() {
+    async fn social_graph_profile_accepts_human() {
+        // Email is never in the identity; Social Graph accepts any human token.
         let claims = human_claims_without_email(ISS, AUD, now_unix() + 3600);
-        let err = run(social_graph_profile(), &claims).await.unwrap_err();
-        assert!(matches!(err, ChirpAuthError::EmailRequired), "got {err:?}");
+        let id = run(social_graph_profile(), &claims).await.expect("accept");
+        assert!(matches!(id, ChirpVerifiedIdentity::Human { .. }));
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn social_graph_profile_rejects_machine_token() {
