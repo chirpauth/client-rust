@@ -44,8 +44,7 @@
 //!   [`ChirpAuthError::EnvironmentMismatch`].
 //!
 //! Test-acceptance is therefore derived from the issuer's environment, not from
-//! a per-call flag. The old [`VerifyOptions::accept_test`] field is retained as
-//! a deprecated no-op so 0.6 callers still compile; it no longer affects policy.
+//! a per-call flag.
 
 pub mod mint;
 
@@ -280,16 +279,6 @@ pub struct VerifyOptions {
     /// When `true`, accept machine tokens (`act == "machine"`) in addition to
     /// human tokens. Default `false`.
     pub accept_machine: bool,
-    /// Deprecated no-op, retained so 0.6 callers compile. Test-acceptance is
-    /// now derived from the configured issuer's [`Environment`]
-    /// ([`ChirpAuthConfig::environment`]), not from this flag. A
-    /// production-configured RP always rejects `test == true` tokens; a
-    /// test-configured RP always accepts them.
-    #[deprecated(
-        since = "0.7.0",
-        note = "no-op: test acceptance is derived from the configured issuer's Environment"
-    )]
-    pub accept_test: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -322,11 +311,6 @@ pub enum ChirpAuthError {
     /// No `Authorization: Bearer …` header, or an empty/whitespace token.
     #[error("missing or empty bearer token")]
     MissingBearer,
-    /// Retained for backward compatibility (0.6). The 0.7 environment-mismatch
-    /// path returns [`ChirpAuthError::EnvironmentMismatch`] instead.
-    #[deprecated(since = "0.7.0", note = "replaced by EnvironmentMismatch")]
-    #[error("test token not accepted by this endpoint")]
-    TestTokenRejected,
 }
 
 #[derive(Debug, Deserialize)]
@@ -599,7 +583,7 @@ pub async fn verify_from_headers(
 /// from `config`'s issuer, and a token whose provenance disagrees is rejected
 /// with [`ChirpAuthError::EnvironmentMismatch`]. A production RP rejects a
 /// `test == true` token; a test RP rejects a non-test token. This replaces the
-/// per-call `accept_test` flag (now a deprecated no-op).
+/// former per-call `accept_test` flag.
 ///
 /// Errors are mapped granularly so the caller can decide which to surface as
 /// "401 Unauthorized" vs "500 Internal" — most consumers collapse everything

@@ -51,7 +51,7 @@ configured issuer and **rejects** a token whose provenance disagrees: a
 production-configured relying party rejects a test-issuer (`test: true`) token,
 and a test-configured RP (issuer `…/test/{tenant}`) rejects a non-test token,
 both with `ChirpAuthError::EnvironmentMismatch`. Test-acceptance is no longer a
-per-call flag (`VerifyOptions::accept_test` is a deprecated no-op).
+per-call flag; it is derived from the configured issuer's `Environment`.
 
 ### Lower-level surface
 
