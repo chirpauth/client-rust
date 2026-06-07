@@ -8,7 +8,8 @@ A Rust client for verifying ID tokens issued by [ChirpAuth](https://signin.chirp
 - Verifies RS256-signed ID tokens against the published signing keys.
 - Validates the standard OIDC claims (`iss`, `aud`, `exp`).
 - Dispatches on the `act` claim to distinguish human-issued from machine-issued tokens.
-- Optionally requires the `email` claim when relying parties need it for user identity.
+- Never exposes a user's email: a relying party cannot obtain it. ChirpAuth holds
+  the address to send magic links / route mediated contact.
 
 ## Usage
 
@@ -27,12 +28,12 @@ let identity = verify_from_headers(
     &http_client,
     request_headers,
     &config,
-    VerifyOptions { require_email: true, ..Default::default() },
+    VerifyOptions { accept_machine: true, ..Default::default() },
 )
 .await?;
 
 match identity {
-    ChirpVerifiedIdentity::Human { sub, email, name, root_sub } => { /* ... */ }
+    ChirpVerifiedIdentity::Human { sub, name, root_sub } => { /* ... */ }
     ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => { /* ... */ }
 }
 ```

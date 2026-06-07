@@ -9,7 +9,8 @@
 //! ChirpAuth issues two shapes of token under the same JWKS:
 //!
 //! - **Human** tokens come out of the Authorization Code + PKCE flow. They
-//!   may carry `email` / `name` claims and have no `act` claim.
+//!   may carry a `name` claim and have no `act` claim. They never carry
+//!   `email` — ChirpAuth never hands a relying party a user's address.
 //! - **Machine** tokens come out of the `client_credentials` grant for
 //!   confidential clients. They carry `act: "machine"` and `owner_sub`
 //!   (the human chirp-sub responsible for the client) and never carry
@@ -179,8 +180,9 @@ fn env_var_names(prefix: &str) -> (String, String) {
 ///
 /// Dispatch is keyed by the `act` claim:
 ///
-/// - `act` absent → [`ChirpVerifiedIdentity::Human`]. `email` / `name` come
-///   through from token claims when present; emptiness normalised to `None`.
+/// - `act` absent → [`ChirpVerifiedIdentity::Human`]. `name` comes through
+///   from token claims when present; emptiness normalised to `None`. A human
+///   never carries `email` — it is structurally absent from the identity.
 /// - `act == "machine"` → [`ChirpVerifiedIdentity::Machine`]. `owner_sub`
 ///   is the human chirp-sub responsible for the confidential client.
 ///   `client_id` is the token's `aud` claim (single-value).
