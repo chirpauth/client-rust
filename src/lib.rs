@@ -197,17 +197,6 @@ pub enum ChirpVerifiedIdentity {
         // ChirpAuth holds the address to send magic links / route mediated
         // contact. See chirp-auth docs/mediated-contact-north-star.md.
         name: Option<String>,
-        /// The root identity behind `sub`. For single-persona users
-        /// (the only case ChirpAuth issues today) equals `sub`. When
-        /// persona issuance ships, distinct from `sub` for any persona
-        /// that's not its own root.
-        ///
-        /// Relying parties doing anti-evasion moderation should key on
-        /// `root_sub` rather than `sub` — a banned root carries its ban
-        /// across all personas. Defaults to `sub` when the claim is
-        /// absent (handles tokens minted before this field existed,
-        /// and machine tokens are never reached on this arm).
-        root_sub: String,
     },
     Machine {
         sub: String,
@@ -331,8 +320,6 @@ struct ChirpClaims {
     owner_sub: Option<String>,
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    root_sub: Option<String>,
     #[serde(default)]
     test: Option<bool>,
 }
@@ -623,7 +610,18 @@ pub async fn verify_chirp_id_token(
 
     let claims: ChirpClaims = serde_json::from_slice(&claims_bytes)
         .map_err(|_| ChirpAuthError::MalformedToken)?;
-    if claims.iss != config.issuer || !claims.aud.matches_any(&config.accepted_audiences) {
+    if claims.iss != config.issuer {
+        return Err(ChirpAuthError::ClaimMismatch);
+    }
+    // Audience rule, by token shape (NOT by "human vs machine"):
+    //   - A human id_token (authorization_code) is minted FOR one relying party,
+    //     so its `aud` must be in this RP's accepted set.
+    //   - A machine token (client_credentials) is an audience-free bearer
+    //     assertion of an agent identity: its `aud` is just the minting client's
+    //     own id, presentable to any service. Audience is NOT enforced here; the
+    //     verifying service authorizes the agent via its own capability ledger.
+    let is_machine = matches!(claims.act.as_deref(), Some("machine"));
+    if !is_machine && !claims.aud.matches_any(&config.accepted_audiences) {
         return Err(ChirpAuthError::ClaimMismatch);
     }
     if claims.exp <= OffsetDateTime::now_utc().unix_timestamp() {
@@ -653,7 +651,6 @@ pub async fn verify_chirp_id_token(
         return Err(ChirpAuthError::InvalidSubject);
     }
 
-    let is_machine = matches!(claims.act.as_deref(), Some("machine"));
     if is_machine {
         if !options.accept_machine {
             return Err(ChirpAuthError::MachineNotAllowed);
@@ -684,17 +681,9 @@ pub async fn verify_chirp_id_token(
         .name
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    // Backward-compat default: tokens minted before the `root_sub` claim
-    // existed have a single-persona identity by construction, so the
-    // root identity is the sub itself.
-    let root_sub = claims
-        .root_sub
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| sub.clone());
     Ok(ChirpVerifiedToken {
         environment,
-        identity: ChirpVerifiedIdentity::Human { sub, name, root_sub },
+        identity: ChirpVerifiedIdentity::Human { sub, name },
     })
 }
 
@@ -803,32 +792,6 @@ mod tests {
     }
 
     #[test]
-    fn chirp_claims_parses_root_sub_when_present_and_absent() {
-        // Absent → None on the wire claim, which the verifier defaults to
-        // `sub` (single-persona limit case + backward-compat with
-        // pre-root_sub tokens).
-        let absent: ChirpClaims = serde_json::from_str(
-            r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1}"#,
-        )
-        .expect("parse");
-        assert_eq!(absent.root_sub, None);
-
-        // Present and equal to sub → today's single-persona shape.
-        let same: ChirpClaims = serde_json::from_str(
-            r#"{"iss":"x","sub":"sub_a","aud":"x","exp":1,"root_sub":"sub_a"}"#,
-        )
-        .expect("parse");
-        assert_eq!(same.root_sub.as_deref(), Some("sub_a"));
-
-        // Present and distinct → forward-compat with persona issuance.
-        let distinct: ChirpClaims = serde_json::from_str(
-            r#"{"iss":"x","sub":"persona_xyz","aud":"x","exp":1,"root_sub":"sub_root_a"}"#,
-        )
-        .expect("parse");
-        assert_eq!(distinct.root_sub.as_deref(), Some("sub_root_a"));
-    }
-
-    #[test]
     fn chirp_claims_parses_test_flag_when_present_and_absent() {
         // Absent → None, which the verifier treats as production provenance.
         let absent: ChirpClaims = serde_json::from_str(
@@ -850,7 +813,6 @@ mod tests {
         let human = ChirpVerifiedIdentity::Human {
             sub: "sub_abc".into(),
             name: None,
-            root_sub: "sub_abc".into(),
         };
         assert_eq!(human.sub(), "sub_abc");
         let machine = ChirpVerifiedIdentity::Machine {
@@ -1410,8 +1372,13 @@ mod verify_path_tests {
     async fn accepts_machine_token_when_accept_machine_true() {
         let jwks = start_jwks_server(jwks_body_with_test_key()).await;
         let exp = now_unix() + 3600;
+        // Audience rule: a machine token's `aud` is its OWN client_id, NOT this
+        // RP's audience. It is presented to a service whose accepted-audience set
+        // does not contain it, and must STILL verify (audience-free bearer
+        // assertion). Here `aud` is a foreign client id, distinct from `AUD`.
+        let foreign_client = "cs_live_some_other_app";
         let claims = format!(
-            r#"{{"iss":"{ISS}","sub":"agent_test","aud":"{AUD}","exp":{exp},"act":"machine","owner_sub":"sub_owner"}}"#
+            r#"{{"iss":"{ISS}","sub":"agent_test","aud":"{foreign_client}","exp":{exp},"act":"machine","owner_sub":"sub_owner"}}"#
         );
         let token = make_signed_jwt(&good_header(), &claims);
         let identity = verify_chirp_id_token(
@@ -1421,13 +1388,13 @@ mod verify_path_tests {
             VerifyOptions { accept_machine: true, ..Default::default() },
         )
         .await
-        .expect("verify machine");
+        .expect("verify machine (audience not enforced)");
         assert_eq!(identity.environment, Environment::Production);
         match identity.identity {
             ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => {
                 assert_eq!(sub, "agent_test");
                 assert_eq!(owner_sub, "sub_owner");
-                assert_eq!(client_id, AUD);
+                assert_eq!(client_id, foreign_client);
             }
             _ => panic!("expected Machine"),
         }
