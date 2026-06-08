@@ -189,15 +189,13 @@ fn env_var_names(prefix: &str) -> (String, String) {
 /// `sub` is always non-empty, ≤ 128 chars, and free of control characters.
 #[derive(Clone, Debug)]
 pub enum ChirpVerifiedIdentity {
-    Human {
-        sub: String,
-        // NOTE: there is intentionally NO `email` field. ChirpAuth never hands a
-        // relying party a user's email address — it is structurally absent from
-        // the verified identity, so an app cannot read it even in principle.
-        // ChirpAuth holds the address to send magic links / route mediated
-        // contact. See chirp-auth docs/mediated-contact-north-star.md.
-        name: Option<String>,
-    },
+    // NOTE: a Human identity is JUST the pairwise `sub`. There is intentionally
+    // NO `email` and NO `name` — ChirpAuth never hands a relying party a
+    // human-readable identifier (apps get a different opaque sub per app, by the
+    // no-email/pairwise privacy design). The address/name live only in chirp,
+    // used to send magic links / route mediated contact. See chirp-auth
+    // docs/mediated-contact-north-star.md.
+    Human { sub: String },
     Machine {
         sub: String,
         owner_sub: String,
@@ -318,8 +316,6 @@ struct ChirpClaims {
     act: Option<String>,
     #[serde(default)]
     owner_sub: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
     #[serde(default)]
     test: Option<bool>,
 }
@@ -677,13 +673,9 @@ pub async fn verify_chirp_id_token(
         });
     }
 
-    let name = claims
-        .name
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
     Ok(ChirpVerifiedToken {
         environment,
-        identity: ChirpVerifiedIdentity::Human { sub, name },
+        identity: ChirpVerifiedIdentity::Human { sub },
     })
 }
 
@@ -810,10 +802,7 @@ mod tests {
 
     #[test]
     fn identity_sub_returns_underlying_sub() {
-        let human = ChirpVerifiedIdentity::Human {
-            sub: "sub_abc".into(),
-            name: None,
-        };
+        let human = ChirpVerifiedIdentity::Human { sub: "sub_abc".into() };
         assert_eq!(human.sub(), "sub_abc");
         let machine = ChirpVerifiedIdentity::Machine {
             sub: "agent_xyz".into(),
