@@ -24,11 +24,15 @@ let config = ChirpAuthConfig::new(DEFAULT_ISSUER, "cs_live_your_client_id");
 let http_client = reqwest::Client::new();
 
 // Extract `Authorization: Bearer …` and verify in one call.
+//
+// To accept machine (agent) tokens, name the minting `client_id`s you trust.
+// The set fails closed: an empty set accepts no machine token. This is the one
+// place the machine-`client_id` allowlist lives — you no longer hand-roll it.
 let identity = verify_from_headers(
     &http_client,
     request_headers,
     &config,
-    VerifyOptions { accept_machine: true, ..Default::default() },
+    VerifyOptions::accept_machine_clients(["cs_live_cg".to_owned()]),
 )
 .await?;
 

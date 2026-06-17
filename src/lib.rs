@@ -17,9 +17,14 @@
 //!   `email`. See `protocols/specs/machine-identity.md`.
 //!
 //! Callers opt in to machine acceptance with [`VerifyOptions::accept_machine`]
-//! (default `false`). Services that only handle humans don't change behavior;
-//! the returned [`ChirpVerifiedIdentity`] is an enum, so call sites `match` on
-//! `Human { .. }` / `Machine { .. }`.
+//! (default `false`) and name the machine `client_id`s they will act on via
+//! [`VerifyOptions::accepted_machine_audiences`] (fail-closed: an empty set
+//! accepts no machine token). A machine token's `aud` is its own minting
+//! client, not this relying party, so the human-path audience allowlist cannot
+//! gate it; this set is the one place that membership rule lives — consumers no
+//! longer hand-roll their own `client_id` allowlist. Services that only handle
+//! humans don't change behavior; the returned [`ChirpVerifiedIdentity`] is an
+//! enum, so call sites `match` on `Human { .. }` / `Machine { .. }`.
 //!
 //! [`verify_chirp_id_token`] returns a [`ChirpVerifiedToken`] carrying two
 //! orthogonal axes: the [`Environment`] (`Production`/`Test`) the verifying
@@ -266,6 +271,45 @@ pub struct VerifyOptions {
     /// When `true`, accept machine tokens (`act == "machine"`) in addition to
     /// human tokens. Default `false`.
     pub accept_machine: bool,
+    /// The set of machine `client_id`s this relying party will act on.
+    ///
+    /// A machine token's `client_id` is its own minting client (its `aud`); it
+    /// is an audience-free bearer assertion presentable to any service, so the
+    /// human-path audience allowlist does NOT gate it. Each consuming service
+    /// instead used to hand-roll a membership check on the returned `client_id`
+    /// (Drive/Granite/Social Graph all duplicated the same code). That rule now
+    /// lives here, in one audited place.
+    ///
+    /// When `accept_machine` is `true`, the verified machine `client_id` MUST be
+    /// a member of this set or the token is rejected with
+    /// [`ChirpAuthError::MachineAudienceNotAccepted`]. The set **fails closed**:
+    /// an empty set accepts no machine token (so a service that opts into
+    /// machine acceptance without naming any client gets nothing through, rather
+    /// than silently trusting every agent). Ignored when `accept_machine` is
+    /// `false`.
+    pub accepted_machine_audiences: BTreeSet<String>,
+}
+
+impl VerifyOptions {
+    /// Build options that accept machine tokens minted by any of `client_ids`.
+    ///
+    /// Convenience over the struct literal for the common "accept machine, gated
+    /// to these clients" case. Equivalent to
+    /// `VerifyOptions { accept_machine: true, accepted_machine_audiences: …, ..Default::default() }`.
+    /// An empty iterator yields an opt-in that accepts no machine token
+    /// (fail-closed); see [`accepted_machine_audiences`].
+    ///
+    /// [`accepted_machine_audiences`]: VerifyOptions::accepted_machine_audiences
+    pub fn accept_machine_clients(client_ids: impl IntoIterator<Item = String>) -> Self {
+        VerifyOptions {
+            accept_machine: true,
+            accepted_machine_audiences: client_ids
+                .into_iter()
+                .map(|id| id.trim().to_owned())
+                .collect(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -288,6 +332,12 @@ pub enum ChirpAuthError {
     InvalidSubject,
     #[error("machine token not accepted by this endpoint")]
     MachineNotAllowed,
+    /// The token verified as a machine identity, but its `client_id` is not in
+    /// [`VerifyOptions::accepted_machine_audiences`]. Distinct from
+    /// [`MachineNotAllowed`] (which means this RP accepts no machine tokens at
+    /// all): here machine tokens ARE accepted, just not from this client.
+    #[error("machine token client_id not in accepted-machine-audiences set")]
+    MachineAudienceNotAccepted,
     #[error("machine token missing owner_sub")]
     MalformedMachineToken,
     /// The token's provenance (production vs. test) disagrees with the
@@ -663,6 +713,15 @@ pub async fn verify_chirp_id_token(
             .single()
             .map(str::to_owned)
             .ok_or(ChirpAuthError::MalformedMachineToken)?;
+        // Accepted-machine-audiences gate. The human-path audience allowlist
+        // does NOT apply to machine tokens (their `aud` is the minting client,
+        // not this RP), so the only place a service can scope WHICH agents may
+        // act on it is the verified `client_id`. Consumers used to re-implement
+        // this membership check each (Drive/Granite/SG); it now lives here,
+        // once. Fails closed: an empty accepted set lets no machine token in.
+        if !options.accepted_machine_audiences.contains(&client_id) {
+            return Err(ChirpAuthError::MachineAudienceNotAccepted);
+        }
         return Ok(ChirpVerifiedToken {
             environment,
             identity: ChirpVerifiedIdentity::Machine {
@@ -1374,10 +1433,10 @@ mod verify_path_tests {
             &reqwest::Client::new(),
             &config_pointing_at(jwks),
             &token,
-            VerifyOptions { accept_machine: true, ..Default::default() },
+            VerifyOptions::accept_machine_clients([foreign_client.to_owned()]),
         )
         .await
-        .expect("verify machine (audience not enforced)");
+        .expect("verify machine (human audience not enforced; client_id allowlisted)");
         assert_eq!(identity.environment, Environment::Production);
         match identity.identity {
             ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => {
@@ -1389,21 +1448,93 @@ mod verify_path_tests {
         }
     }
 
+    // -------------------- accepted-machine-audiences gate --------------
+    //
+    // The machine `client_id` membership check now lives in the library (it
+    // used to be re-implemented by Drive/Granite/Social Graph). Three cases:
+    // an allowed client passes, a disallowed client is rejected, and an empty
+    // accepted set fails closed.
+
+    fn machine_token_with_client(client_id: &str) -> String {
+        let exp = now_unix() + 3600;
+        format!(
+            r#"{{"iss":"{ISS}","sub":"agent_test","aud":"{client_id}","exp":{exp},"act":"machine","owner_sub":"sub_owner"}}"#
+        )
+    }
+
+    /// A machine token whose `client_id` is in the accepted set passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn machine_audience_allowed_client_passes() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let client_id = "cs_live_cg";
+        let token = make_signed_jwt(&good_header(), &machine_token_with_client(client_id));
+        let identity = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::accept_machine_clients([client_id.to_owned()]),
+        )
+        .await
+        .expect("allowlisted machine client_id accepted");
+        match identity.identity {
+            ChirpVerifiedIdentity::Machine { client_id: got, .. } => assert_eq!(got, client_id),
+            _ => panic!("expected Machine"),
+        }
+    }
+
+    /// A machine token whose `client_id` is NOT in the accepted set is rejected
+    /// with [`ChirpAuthError::MachineAudienceNotAccepted`] — distinct from
+    /// `MachineNotAllowed` (machine tokens ARE accepted here, just not this one).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn machine_audience_disallowed_client_rejected() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &machine_token_with_client("cs_live_intruder"));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::accept_machine_clients(["cs_live_cg".to_owned()]),
+        )
+        .await
+        .expect_err("non-allowlisted machine client_id rejected");
+        assert!(matches!(err, ChirpAuthError::MachineAudienceNotAccepted), "got {err:?}");
+    }
+
+    /// `accept_machine: true` with an EMPTY accepted set fails closed: no machine
+    /// token gets through, rather than silently trusting every agent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn machine_audience_empty_set_rejects() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &machine_token_with_client("cs_live_cg"));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions { accept_machine: true, ..Default::default() },
+        )
+        .await
+        .expect_err("empty accepted-machine-audiences set rejects all machine tokens");
+        assert!(matches!(err, ChirpAuthError::MachineAudienceNotAccepted), "got {err:?}");
+    }
+
     // -------------------- consumer-profile contract tests --------------
     //
     // Three downstream services consume this crate and each calls
     // verify_chirp_id_token with a different VerifyOptions config:
     //
-    //   Drive        → { accept_machine: true  }
-    //   Pigeon       → { accept_machine: true  }
-    //   Social Graph → { accept_machine: false }
+    //   Drive        → accept machine, gated to its CG client_id(s)
+    //   Pigeon       → accept machine, gated to its CG client_id(s)
+    //   Social Graph → human only (accept_machine: false)
     // There is no email axis — email is never in a token or the verified identity.
+    // The accepted-machine-audiences gate now lives in the library; the profile
+    // helpers below name `AUD` as the one machine client these services accept
+    // (the machine fixtures mint with `aud == AUD`).
 
     fn drive_profile() -> VerifyOptions {
-        VerifyOptions { accept_machine: true, ..Default::default() }
+        VerifyOptions::accept_machine_clients([AUD.to_owned()])
     }
     fn pigeon_profile() -> VerifyOptions {
-        VerifyOptions { accept_machine: true, ..Default::default() }
+        VerifyOptions::accept_machine_clients([AUD.to_owned()])
     }
     fn social_graph_profile() -> VerifyOptions {
         VerifyOptions { accept_machine: false, ..Default::default() }
