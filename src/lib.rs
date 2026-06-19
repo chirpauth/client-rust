@@ -297,6 +297,106 @@ pub struct ChirpVerifiedToken {
     pub identity: ChirpVerifiedIdentity,
 }
 
+/// The canonical, platform-wide verified-identity carrier.
+///
+/// Every platform service calls [`verify_chirp_id_token`] and gets back a
+/// [`ChirpVerifiedToken`] whose two axes — the [`ChirpVerifiedIdentity`]
+/// principal and the [`Environment`] provenance — are *separate*. Historically
+/// each consumer then collapsed both axes into its own bare-`String`
+/// `AuthenticatedUser { uid }` at the service boundary, discarding the class
+/// (`Human`/`Machine`/`Test`), the `owner_sub`/`client_id` of a machine caller,
+/// and the keyset provenance. That made an illegal trust decision (honoring a
+/// test principal as production, or a machine where a human is expected)
+/// expressible — the type no longer carried what would have made it a compile
+/// error.
+///
+/// `VerifiedIdentity` is that one carrier: it folds the principal class and the
+/// environment provenance into a single value a service can store and pass
+/// around *without* losing either axis. It is deliberately named
+/// `VerifiedIdentity` (not `ChirpVerifiedIdentity`) to signal it is the
+/// platform-canonical shape services carry, distinct from the verifier's raw
+/// principal enum.
+///
+/// Build one from a verified token via [`VerifiedIdentity::from_token`]. Read
+/// the common `sub` with [`sub`](Self::sub) and the provenance with
+/// [`environment`](Self::environment); ask the class with
+/// [`is_machine`](Self::is_machine) / [`is_test`](Self::is_test), or `match`
+/// for the full shape (a missed class stays a compile error).
+#[derive(Clone, Debug)]
+pub enum VerifiedIdentity {
+    /// A human sign-in (Authorization Code + PKCE). Carries only the pairwise
+    /// `sub` (no email/name, by the no-email privacy design) and the keyset
+    /// provenance.
+    Human {
+        sub: String,
+        environment: Environment,
+    },
+    /// A confidential-client machine caller (`client_credentials`). Carries the
+    /// agent `sub`, the responsible human `owner_sub`, the minting `client_id`,
+    /// and the keyset provenance.
+    Machine {
+        sub: String,
+        owner_sub: String,
+        client_id: String,
+        environment: Environment,
+    },
+    /// A test-keyset principal (verified against a `…/test/{tenant}` issuer).
+    /// Structurally distinct from `Human` so a production surface cannot honor
+    /// it by forgetting to inspect the environment axis.
+    Test {
+        sub: String,
+        environment: Environment,
+    },
+}
+
+impl VerifiedIdentity {
+    /// Fold a verified token's principal + provenance into the canonical
+    /// carrier. Total over [`ChirpVerifiedIdentity`]'s variants.
+    pub fn from_token(token: ChirpVerifiedToken) -> Self {
+        let environment = token.environment;
+        match token.identity {
+            ChirpVerifiedIdentity::Human { sub } => Self::Human { sub, environment },
+            ChirpVerifiedIdentity::Machine {
+                sub,
+                owner_sub,
+                client_id,
+            } => Self::Machine {
+                sub,
+                owner_sub,
+                client_id,
+                environment,
+            },
+            ChirpVerifiedIdentity::Test { sub } => Self::Test { sub, environment },
+        }
+    }
+
+    /// The token's `sub` claim regardless of variant.
+    pub fn sub(&self) -> &str {
+        match self {
+            Self::Human { sub, .. } | Self::Machine { sub, .. } | Self::Test { sub, .. } => sub,
+        }
+    }
+
+    /// The keyset provenance ([`Environment`]) this identity was verified under.
+    pub fn environment(&self) -> Environment {
+        match self {
+            Self::Human { environment, .. }
+            | Self::Machine { environment, .. }
+            | Self::Test { environment, .. } => *environment,
+        }
+    }
+
+    /// `true` for a [`Machine`](Self::Machine) caller.
+    pub fn is_machine(&self) -> bool {
+        matches!(self, Self::Machine { .. })
+    }
+
+    /// `true` for a [`Test`](Self::Test) principal.
+    pub fn is_test(&self) -> bool {
+        matches!(self, Self::Test { .. })
+    }
+}
+
 /// Per-call knobs for [`verify_chirp_id_token`].
 ///
 /// Defaults to human-only acceptance — machine tokens are rejected with
@@ -971,6 +1071,51 @@ mod tests {
         assert_eq!(machine.sub(), "agent_xyz");
         let test = ChirpVerifiedIdentity::Test { sub: "sub_test_principal".into() };
         assert_eq!(test.sub(), "sub_test_principal");
+    }
+
+    #[test]
+    fn verified_identity_folds_token_axes() {
+        // Human: carries sub + provenance, classifies as neither machine nor test.
+        let human = VerifiedIdentity::from_token(ChirpVerifiedToken {
+            environment: Environment::Production,
+            identity: ChirpVerifiedIdentity::Human { sub: "sub_h".into() },
+        });
+        assert_eq!(human.sub(), "sub_h");
+        assert_eq!(human.environment(), Environment::Production);
+        assert!(!human.is_machine());
+        assert!(!human.is_test());
+
+        // Machine: owner_sub + client_id survive the fold (previously discarded).
+        let machine = VerifiedIdentity::from_token(ChirpVerifiedToken {
+            environment: Environment::Production,
+            identity: ChirpVerifiedIdentity::Machine {
+                sub: "agent".into(),
+                owner_sub: "sub_owner".into(),
+                client_id: "cs_live_1".into(),
+            },
+        });
+        assert_eq!(machine.sub(), "agent");
+        assert!(machine.is_machine());
+        match machine {
+            VerifiedIdentity::Machine {
+                owner_sub,
+                client_id,
+                ..
+            } => {
+                assert_eq!(owner_sub, "sub_owner");
+                assert_eq!(client_id, "cs_live_1");
+            }
+            _ => panic!("expected machine"),
+        }
+
+        // Test: provenance is Test and the class is distinguishable.
+        let test = VerifiedIdentity::from_token(ChirpVerifiedToken {
+            environment: Environment::Test,
+            identity: ChirpVerifiedIdentity::Test { sub: "sub_t".into() },
+        });
+        assert_eq!(test.sub(), "sub_t");
+        assert_eq!(test.environment(), Environment::Test);
+        assert!(test.is_test());
     }
 
     // -------------------- bearer extraction --------------------
