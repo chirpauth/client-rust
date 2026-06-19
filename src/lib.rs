@@ -348,12 +348,35 @@ pub enum ChirpAuthError {
     /// No `Authorization: Bearer …` header, or an empty/whitespace token.
     #[error("missing or empty bearer token")]
     MissingBearer,
+    /// The JWT `typ` header is PRESENT but does not match the token class this
+    /// verifier expects (e.g. a key-binding cert presented as an ID token).
+    /// Header-level class isolation, distinct from any claim-shape rejection. A
+    /// FULLY ABSENT `typ` never reaches this check: `typ` is a required header
+    /// field, so a header without it fails to deserialize and is rejected as
+    /// [`MalformedToken`](Self::MalformedToken). See [`ID_TOKEN_TYP`] /
+    /// [`KEYBIND_TYP`].
+    #[error("typ header does not match the expected token class")]
+    InvalidTokenType,
 }
+
+/// JWT `typ` for the ChirpAuth ID-token class (human / machine / test). The
+/// issuer stamps this on every ID token; this verifier requires an exact match.
+pub const ID_TOKEN_TYP: &str = "chirp-id+jwt";
+/// JWT `typ` for ChirpAuth key-binding certificates. Pass to [`verify_rs256_jws`]
+/// when verifying a cert so a cert can't be honored as an ID token (or vice
+/// versa).
+pub const KEYBIND_TYP: &str = "chirp-keybind+jwt";
 
 #[derive(Debug, Deserialize)]
 struct JwtHeader {
     alg: String,
     kid: String,
+    /// Token-class marker. Required (no `#[serde(default)]`): a header without a
+    /// `typ` (pre-hardening) fails to deserialize and is rejected as
+    /// [`ChirpAuthError::MalformedToken`] before any class check — there is no
+    /// legacy/absent acceptance. Verifiers assert a PRESENT `typ` equals their
+    /// expected class string (a mismatch → [`ChirpAuthError::InvalidTokenType`]).
+    typ: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -515,16 +538,25 @@ pub struct Claims {
 /// key-binding certificates) reuses one audited RS256 path rather than
 /// re-implementing JWKS fetch + signature checks.
 ///
-/// Checks: RS256 alg pin (header and JWK), kid lookup in the JWKS, signature,
-/// exact `iss == config.issuer`, and `exp` in the future. When `validate_aud`
-/// is `true`, also requires at least one `aud` value in
-/// [`ChirpAuthConfig::accepted_audiences`]. Does **not** apply machine/test
-/// policy — that lives in [`verify_chirp_id_token`].
+/// Checks: RS256 alg pin (header and JWK), the `typ` header equals
+/// `expected_typ`, kid lookup in the JWKS, signature, exact `iss ==
+/// config.issuer`, and `exp` in the future. When `validate_aud` is `true`, also
+/// requires at least one `aud` value in [`ChirpAuthConfig::accepted_audiences`].
+/// Does **not** apply machine/test policy — that lives in
+/// [`verify_chirp_id_token`].
+///
+/// `expected_typ` is the token-class header this caller accepts (e.g.
+/// [`KEYBIND_TYP`] for a key-binding cert). A token whose `typ` is PRESENT but
+/// differs is rejected with [`ChirpAuthError::InvalidTokenType`]; a token with NO
+/// `typ` header fails header deserialization and is rejected as
+/// [`ChirpAuthError::MalformedToken`]. Either way, one ChirpAuth-signed artifact
+/// class can never be honored as another.
 pub async fn verify_rs256_jws(
     client: &reqwest::Client,
     config: &ChirpAuthConfig,
     token: &str,
     validate_aud: bool,
+    expected_typ: &str,
 ) -> Result<Claims, ChirpAuthError> {
     let parts = jwt_parts(token)?;
     let header_bytes = URL_SAFE_NO_PAD
@@ -540,6 +572,9 @@ pub async fn verify_rs256_jws(
         .map_err(|_| ChirpAuthError::MalformedToken)?;
     if header.alg != "RS256" {
         return Err(ChirpAuthError::UnsupportedAlgorithm);
+    }
+    if header.typ != expected_typ {
+        return Err(ChirpAuthError::InvalidTokenType);
     }
 
     let jwks = fetch_jwks(client, config).await?;
@@ -641,6 +676,17 @@ pub async fn verify_chirp_id_token(
         .map_err(|_| ChirpAuthError::MalformedToken)?;
     if header.alg != "RS256" {
         return Err(ChirpAuthError::UnsupportedAlgorithm);
+    }
+    // Header-level class isolation: an ID token MUST carry `typ: chirp-id+jwt`.
+    // A key-binding cert (`chirp-keybind+jwt`), or any other PRESENT-but-wrong
+    // `typ`, is rejected here as `InvalidTokenType` before any claim inspection.
+    // A pre-hardening token with NO `typ` never reaches this line: `typ` is a
+    // required header field, so its absence already failed header deserialization
+    // above as `MalformedToken`. Human / machine / test ID tokens all share this
+    // one typ; the human-vs-machine split is the `act` claim, the prod-vs-test
+    // split is the issuer-derived environment.
+    if header.typ != ID_TOKEN_TYP {
+        return Err(ChirpAuthError::InvalidTokenType);
     }
 
     let jwks = fetch_jwks(client, config).await?;
@@ -1047,7 +1093,7 @@ mod verify_path_tests {
     }
 
     fn good_header() -> String {
-        format!(r#"{{"alg":"RS256","typ":"JWT","kid":"{KID}"}}"#)
+        format!(r#"{{"alg":"RS256","typ":"{ID_TOKEN_TYP}","kid":"{KID}"}}"#)
     }
 
     /// A production-issuer config whose JWKS fetch is pointed at the in-process
@@ -1228,15 +1274,66 @@ mod verify_path_tests {
         assert!(matches!(err, ChirpAuthError::UnsupportedAlgorithm), "got {err:?}");
     }
 
+    /// Header-level class isolation: a token with the key-binding `typ` (a
+    /// validly chirp-signed cert) presented to the ID-token verifier is rejected
+    /// on `typ` — never honored as an ID token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_keybind_typ_on_id_token_path() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let header = format!(r#"{{"alg":"RS256","typ":"{KEYBIND_TYP}","kid":"{KID}"}}"#);
+        let token = make_signed_jwt(&header, &good_claims(ISS, AUD, now_unix() + 3600));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::InvalidTokenType), "got {err:?}");
+    }
+
+    /// A pre-hardening token with the old `typ: "JWT"` (no class marker) is
+    /// rejected — there is no legacy/absent acceptance.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_legacy_jwt_typ_on_id_token_path() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let header = format!(r#"{{"alg":"RS256","typ":"JWT","kid":"{KID}"}}"#);
+        let token = make_signed_jwt(&header, &good_claims(ISS, AUD, now_unix() + 3600));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::InvalidTokenType), "got {err:?}");
+    }
+
+    /// `verify_rs256_jws` rejects a token whose `typ` differs from the caller's
+    /// `expected_typ` — an ID token cannot be verified through the keybind path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_rs256_jws_enforces_expected_typ() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let config = config_pointing_at(jwks);
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        // good_header() carries ID_TOKEN_TYP; asking for KEYBIND_TYP must fail.
+        let err = verify_rs256_jws(&reqwest::Client::new(), &config, &token, false, KEYBIND_TYP)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::InvalidTokenType), "got {err:?}");
+    }
+
     /// Algorithm-confusion / kid-confusion: token claims an RS256 alg with
     /// a kid the JWKS doesn't advertise. Must fail at key lookup, not
     /// silently accept against some other key.
     #[tokio::test(flavor = "multi_thread")]
     async fn rejects_unknown_kid() {
         let jwks = start_jwks_server(jwks_body_with_test_key()).await;
-        let header = r#"{"alg":"RS256","typ":"JWT","kid":"never-issued"}"#;
+        let header = format!(r#"{{"alg":"RS256","typ":"{ID_TOKEN_TYP}","kid":"never-issued"}}"#);
         let claims = good_claims(ISS, AUD, now_unix() + 3600);
-        let token = make_jwt_with_signature(header, &claims, &[0u8; 256]);
+        let token = make_jwt_with_signature(&header, &claims, &[0u8; 256]);
         let err = verify_chirp_id_token(
             &reqwest::Client::new(),
             &config_pointing_at(jwks),
@@ -1388,7 +1485,7 @@ mod verify_path_tests {
             r#"{{"iss":"{ISS}","sub":"sub_test","aud":"{AUD}","exp":{exp},"bound_pubkey":"ed25519:abc"}}"#
         );
         let token = make_signed_jwt(&good_header(), &claims);
-        let verified = verify_rs256_jws(&reqwest::Client::new(), &config, &token, true)
+        let verified = verify_rs256_jws(&reqwest::Client::new(), &config, &token, true, ID_TOKEN_TYP)
             .await
             .expect("verify");
         assert_eq!(verified.sub, "sub_test");
@@ -1409,7 +1506,7 @@ mod verify_path_tests {
             r#"{{"iss":"{ISS}","sub":"sub_test","aud":"cs_unrelated","exp":{exp}}}"#
         );
         let token = make_signed_jwt(&good_header(), &claims);
-        let verified = verify_rs256_jws(&reqwest::Client::new(), &config, &token, false)
+        let verified = verify_rs256_jws(&reqwest::Client::new(), &config, &token, false, ID_TOKEN_TYP)
             .await
             .expect("verify without aud validation");
         assert_eq!(verified.sub, "sub_test");
