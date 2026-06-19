@@ -29,11 +29,15 @@
 //! [`verify_chirp_id_token`] returns a [`ChirpVerifiedToken`] carrying two
 //! orthogonal axes: the [`Environment`] (`Production`/`Test`) the verifying
 //! keyset belongs to — **provenance, derived from which issuer/JWKS matched,
-//! not from any claim** — and the [`ChirpVerifiedIdentity`] principal
-//! (`Human`/`Machine`). A relying party therefore cannot mistake a test
-//! identity for a production one, or a machine for a human, by forgetting a
-//! marker: both distinctions are in the type. Access the principal via
-//! `token.identity`.
+//! not from any claim** — and the [`ChirpVerifiedIdentity`] principal, a sum
+//! type TOTAL over the RP-visible classes (`Human` / `Machine` / `Test`). A
+//! relying party therefore cannot mistake a test identity for a production
+//! human, or a machine for a human, by forgetting a marker: every distinction
+//! is in the type and a missed class is a compile error. Access the principal
+//! via `token.identity`. (Two further service classes never surface here as
+//! identities: a `dev_…`-key bearer fails key lookup, and a key-binding cert is
+//! verified through [`verify_rs256_jws`], not as a principal — see
+//! [`ChirpVerifiedIdentity`].)
 //!
 //! ## Environment enforcement (0.7)
 //!
@@ -180,16 +184,43 @@ fn env_var_names(prefix: &str) -> (String, String) {
     }
 }
 
-/// The verified identity extracted from a ChirpAuth ID token.
+/// The verified identity extracted from a ChirpAuth ID token — TOTAL over the
+/// classes a relying party can legitimately receive through
+/// [`verify_chirp_id_token`].
 ///
-/// Dispatch is keyed by the `act` claim:
+/// INV-09 (token-class ADT): this is the RP-facing projection of the service's
+/// `VerifiedToken` sum type (`docs/inv-09-token-class-adt.md`). "Which class is
+/// this?" is a property of the **type**, recovered once at verify and `match`ed
+/// at every call site, rather than re-derived from which optional discriminator
+/// (`act`/`test`) happens to be set. A relying party that handles only
+/// production humans must add a `Test`/`Machine` arm or fail to compile — a
+/// test principal can never be silently honored as a production human.
 ///
-/// - `act` absent → [`ChirpVerifiedIdentity::Human`]. `name` comes through
-///   from token claims when present; emptiness normalised to `None`. A human
-///   never carries `email` — it is structurally absent from the identity.
-/// - `act == "machine"` → [`ChirpVerifiedIdentity::Machine`]. `owner_sub`
-///   is the human chirp-sub responsible for the confidential client.
-///   `client_id` is the token's `aud` claim (single-value).
+/// Dispatch is the triple `(typ family, issuer-derived environment, act)`:
+///
+/// - `typ == `[`ID_TOKEN_TYP`]: the ID-token family (Human/Machine/Test). A
+///   key-binding cert (`typ == `[`KEYBIND_TYP`]) is rejected here and is NEVER
+///   an identity — it is verified through [`verify_rs256_jws`] as a confirmation
+///   artifact, not a principal, so a `cnf` cert cannot be confused with a login.
+/// - production environment + `act` absent → [`ChirpVerifiedIdentity::Human`].
+///   A human never carries `email` or `name` — both are structurally absent.
+/// - `act == "machine"` → [`ChirpVerifiedIdentity::Machine`]. `owner_sub` is the
+///   human chirp-sub responsible for the confidential client; `client_id` is the
+///   token's `aud` claim (single-value).
+/// - test environment + `act` absent → [`ChirpVerifiedIdentity::Test`]. Only a
+///   test-issuer-configured RP can observe this (environment enforcement rejects
+///   a `test` token at a production RP before any identity is built); it mirrors
+///   the service's `VerifiedToken::Test`, keeping a test principal structurally
+///   distinct from a production human.
+///
+/// Two RP-facing classes the service models but that DO NOT appear here, by
+/// construction — so neither can masquerade as an identity:
+/// - **DevBearer** (`dev_…`-key control-plane bearer): the dev signing key is
+///   excluded from this verifier's keyset, so a dev token fails key lookup
+///   ([`ChirpAuthError::NoMatchingKey`]) and is never returned as an identity.
+/// - **KeyBind** (`chirp-keybind+jwt` confirmation cert): not an identity at all
+///   — verified via [`verify_rs256_jws`] with `expected_typ = `[`KEYBIND_TYP`],
+///   rejected on the ID-token path by the `typ` gate.
 ///
 /// `sub` is always non-empty, ≤ 128 chars, and free of control characters.
 #[derive(Clone, Debug)]
@@ -206,13 +237,23 @@ pub enum ChirpVerifiedIdentity {
         owner_sub: String,
         client_id: String,
     },
+    /// A test-environment principal: a non-machine token verified against a
+    /// `…/test/{tenant}` issuer's keyset (so its [`Environment`] is
+    /// [`Environment::Test`]). Structurally distinct from [`Human`] so a
+    /// production surface cannot honor a test identity by forgetting to inspect
+    /// the environment axis — mirrors the service's `VerifiedToken::Test`. The
+    /// keyset-provenance tenant lives on the [`ChirpVerifiedToken::environment`]
+    /// axis (derived from the verified issuer), not duplicated here.
+    ///
+    /// [`Human`]: ChirpVerifiedIdentity::Human
+    Test { sub: String },
 }
 
 impl ChirpVerifiedIdentity {
     /// The token's `sub` claim regardless of variant.
     pub fn sub(&self) -> &str {
         match self {
-            Self::Human { sub, .. } | Self::Machine { sub, .. } => sub,
+            Self::Human { sub, .. } | Self::Machine { sub, .. } | Self::Test { sub, .. } => sub,
         }
     }
 }
@@ -641,11 +682,14 @@ pub async fn verify_from_headers(
 /// it on top (ChirpAuth JWKS rotation is on the order of hours/days; per-request
 /// fetch is fine for current call volumes but worth revisiting if hot).
 ///
-/// Returns [`ChirpVerifiedIdentity::Human`] or [`ChirpVerifiedIdentity::Machine`]
-/// based on the `act` claim. Callers that don't accept machine identities leave
-/// `options.accept_machine = false` (the default) and never see a `Machine`
-/// arm in practice — the verifier rejects with [`ChirpAuthError::MachineNotAllowed`]
-/// first.
+/// Returns a [`ChirpVerifiedIdentity`] — `Machine` when `act == "machine"`,
+/// else `Test` under a test issuer or `Human` under a production issuer (the
+/// identity class follows the verified keyset's environment). Callers that don't
+/// accept machine identities leave `options.accept_machine = false` (the
+/// default) and never see a `Machine` arm in practice — the verifier rejects
+/// with [`ChirpAuthError::MachineNotAllowed`] first. A production RP never sees
+/// `Test` (environment enforcement rejects a `test` token first); a test RP
+/// never sees `Human`.
 ///
 /// **Environment is enforced** (0.7): the expected [`Environment`] is derived
 /// from `config`'s issuer, and a token whose provenance disagrees is rejected
@@ -778,9 +822,19 @@ pub async fn verify_chirp_id_token(
         });
     }
 
+    // Non-machine ID token. The principal class follows the verified
+    // environment (provenance): a test-keyset token is a `Test` principal, a
+    // production-keyset token is a `Human`. Environment enforcement above has
+    // already rejected any token whose `test` claim disagrees with the
+    // configured issuer, so this match is exhaustive over the reachable cases:
+    // a production RP only ever reaches `Human`, a test RP only `Test`.
+    let identity = match environment {
+        Environment::Production => ChirpVerifiedIdentity::Human { sub },
+        Environment::Test => ChirpVerifiedIdentity::Test { sub },
+    };
     Ok(ChirpVerifiedToken {
         environment,
-        identity: ChirpVerifiedIdentity::Human { sub },
+        identity,
     })
 }
 
@@ -915,6 +969,8 @@ mod tests {
             client_id: "cs_live_1".into(),
         };
         assert_eq!(machine.sub(), "agent_xyz");
+        let test = ChirpVerifiedIdentity::Test { sub: "sub_test_principal".into() };
+        assert_eq!(test.sub(), "sub_test_principal");
     }
 
     // -------------------- bearer extraction --------------------
@@ -1786,7 +1842,39 @@ mod verify_path_tests {
         .await
         .expect("verify test token under test RP");
         assert_eq!(verified.environment, Environment::Test);
-        assert!(matches!(verified.identity, ChirpVerifiedIdentity::Human { .. }));
+        // A non-machine token under a test issuer is a `Test` principal, NOT a
+        // `Human` — the class follows the verified keyset's environment so a
+        // test identity is structurally distinct from a production human.
+        match verified.identity {
+            ChirpVerifiedIdentity::Test { sub } => assert_eq!(sub, "sub_test"),
+            other => panic!("expected Test, got {other:?}"),
+        }
+    }
+
+    /// A machine token under a test issuer stays `Machine` (the service
+    /// classifies machine before test); its test provenance rides the
+    /// [`Environment`] axis, not the identity variant. Confirms the test-env
+    /// `Test` carve-out does not swallow a test-env machine principal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rp_machine_token_is_machine_not_test() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let (config, test_iss) = test_issuer_config(jwks);
+        let exp = now_unix() + 3600;
+        let foreign_client = "cs_live_agent";
+        let claims = format!(
+            r#"{{"iss":"{test_iss}","sub":"agent_test","aud":"{foreign_client}","exp":{exp},"act":"machine","owner_sub":"sub_owner","test":true}}"#
+        );
+        let token = make_signed_jwt(&good_header(), &claims);
+        let verified = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config,
+            &token,
+            VerifyOptions::accept_machine_clients([foreign_client.to_owned()]),
+        )
+        .await
+        .expect("verify test-env machine token");
+        assert_eq!(verified.environment, Environment::Test);
+        assert!(matches!(verified.identity, ChirpVerifiedIdentity::Machine { .. }));
     }
 
     /// Test RP + non-test token → rejected. The symmetric direction: a test
