@@ -286,8 +286,28 @@ pub struct VerifyOptions {
     /// an empty set accepts no machine token (so a service that opts into
     /// machine acceptance without naming any client gets nothing through, rather
     /// than silently trusting every agent). Ignored when `accept_machine` is
-    /// `false`.
+    /// `false`, or when `accept_any_machine_client` is `true`.
     pub accepted_machine_audiences: BTreeSet<String>,
+    /// When `true` (and `accept_machine` is `true`), a verified machine token is
+    /// accepted REGARDLESS of `accepted_machine_audiences` membership: the
+    /// audience gate is skipped and the `Machine { client_id, .. }` identity is
+    /// returned for the relying party to police itself.
+    ///
+    /// This exists for services whose authorization does NOT hinge on *which*
+    /// machine client authenticated, but on a per-operation capability the
+    /// caller must separately present (e.g. Drive: every machine read/write to
+    /// user data requires an owner-created grant naming the caller's `agent_sub`,
+    /// so gating authentication by `client_id` is redundant and only blocks
+    /// self-serve callers). Such a service opts in here and applies its own
+    /// policy to the returned `client_id` — gating only grant-less privileged
+    /// paths, or nothing at all.
+    ///
+    /// Default `false` → the fail-closed `accepted_machine_audiences` gate
+    /// applies unchanged (every existing consumer is unaffected). Setting this
+    /// is a deliberate decision to move the "which client" question out of
+    /// authentication into the RP's own authorization layer; do NOT set it
+    /// unless every effect the caller can reach is independently authorized.
+    pub accept_any_machine_client: bool,
 }
 
 impl VerifyOptions {
@@ -719,7 +739,13 @@ pub async fn verify_chirp_id_token(
         // act on it is the verified `client_id`. Consumers used to re-implement
         // this membership check each (Drive/Granite/SG); it now lives here,
         // once. Fails closed: an empty accepted set lets no machine token in.
-        if !options.accepted_machine_audiences.contains(&client_id) {
+        //
+        // `accept_any_machine_client` opts OUT of this gate: a service whose
+        // authorization is per-operation (e.g. Drive's owner grants) accepts any
+        // verified machine token and polices the returned `client_id` itself.
+        if !options.accept_any_machine_client
+            && !options.accepted_machine_audiences.contains(&client_id)
+        {
             return Err(ChirpAuthError::MachineAudienceNotAccepted);
         }
         return Ok(ChirpVerifiedToken {
@@ -1480,6 +1506,56 @@ mod verify_path_tests {
             ChirpVerifiedIdentity::Machine { client_id: got, .. } => assert_eq!(got, client_id),
             _ => panic!("expected Machine"),
         }
+    }
+
+    /// `accept_any_machine_client: true` accepts a machine token whose
+    /// `client_id` is NOT in the accepted set (the audience gate is skipped) and
+    /// returns the `Machine` identity for the RP to police. This is the
+    /// grant-sufficient path: authentication no longer decides "which client".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_any_machine_client_bypasses_audience_gate() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let client_id = "cs_live_unlisted_app";
+        let token = make_signed_jwt(&good_header(), &machine_token_with_client(client_id));
+        let identity = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions {
+                accept_machine: true,
+                // Empty set would normally fail closed; the flag overrides it.
+                accept_any_machine_client: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("any machine client accepted when accept_any_machine_client=true");
+        match identity.identity {
+            ChirpVerifiedIdentity::Machine { client_id: got, .. } => assert_eq!(got, client_id),
+            _ => panic!("expected Machine"),
+        }
+    }
+
+    /// The new flag does not open the human/machine door: `accept_any_machine_client`
+    /// is meaningless without `accept_machine`, so a machine token is still rejected
+    /// with `MachineNotAllowed` when `accept_machine` is false.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_any_machine_client_requires_accept_machine() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &machine_token_with_client("cs_live_x"));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions {
+                accept_machine: false,
+                accept_any_machine_client: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("machine still rejected when accept_machine=false");
+        assert!(matches!(err, ChirpAuthError::MachineNotAllowed), "got {err:?}");
     }
 
     /// A machine token whose `client_id` is NOT in the accepted set is rejected
