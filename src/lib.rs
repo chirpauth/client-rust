@@ -427,8 +427,23 @@ pub struct VerifyOptions {
     /// an empty set accepts no machine token (so a service that opts into
     /// machine acceptance without naming any client gets nothing through, rather
     /// than silently trusting every agent). Ignored when `accept_machine` is
-    /// `false`.
+    /// `false`, or when `accept_any_machine_client` is `true`.
     pub accepted_machine_audiences: BTreeSet<String>,
+    /// Escape hatch for **grant-scoped** relying parties: when `true` (and
+    /// `accept_machine` is `true`), the [`accepted_machine_audiences`] membership
+    /// check is bypassed and a machine token from ANY `client_id` verifies.
+    ///
+    /// This is the opposite of the fail-closed default and is ONLY sound for a
+    /// service whose authorization does not depend on *which* agent authenticated
+    /// — i.e. one that gates every privileged/data operation on a separate,
+    /// explicit grant (the grant ledger, not a static client_id set, is its
+    /// allowlist). Drive is the canonical case: it accepts any authenticated
+    /// agent for grant-scoped access, then requires an owner grant per operation.
+    /// A service that trusts the verified `client_id` for anything MUST leave
+    /// this `false` and enumerate [`accepted_machine_audiences`] instead.
+    ///
+    /// [`accepted_machine_audiences`]: VerifyOptions::accepted_machine_audiences
+    pub accept_any_machine_client: bool,
 }
 
 impl VerifyOptions {
@@ -925,7 +940,11 @@ pub async fn verify_chirp_id_token(
         // act on it is the verified `client_id`. Consumers used to re-implement
         // this membership check each (Drive/Granite/SG); it now lives here,
         // once. Fails closed: an empty accepted set lets no machine token in.
-        if !options.accepted_machine_audiences.contains(&client_id) {
+        // ...UNLESS the RP opts into grant-scoped acceptance of any agent, where
+        // authorization is its own per-operation grant, not the client_id.
+        if !options.accept_any_machine_client
+            && !options.accepted_machine_audiences.contains(&client_id)
+        {
             return Err(ChirpAuthError::MachineAudienceNotAccepted);
         }
         return Ok(ChirpVerifiedToken {
@@ -1792,6 +1811,34 @@ mod verify_path_tests {
         .expect("allowlisted machine client_id accepted");
         match identity.identity {
             ChirpVerifiedIdentity::Machine { client_id: got, .. } => assert_eq!(got, client_id),
+            _ => panic!("expected Machine"),
+        }
+    }
+
+    /// With `accept_any_machine_client`, a machine token from an UNLISTED client
+    /// (empty allowlist) is accepted — the grant-scoped opt-in for RPs like Drive
+    /// that authorize per-operation via a grant, not by `client_id`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accept_any_machine_client_bypasses_the_allowlist() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &machine_token_with_client("cs_live_unlisted"));
+        let opts = VerifyOptions {
+            accept_machine: true,
+            accept_any_machine_client: true,
+            ..Default::default() // accepted_machine_audiences intentionally EMPTY
+        };
+        let verified = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            opts,
+        )
+        .await
+        .expect("any machine client accepted under the grant-scoped opt-in");
+        match verified.identity {
+            ChirpVerifiedIdentity::Machine { client_id, .. } => {
+                assert_eq!(client_id, "cs_live_unlisted")
+            }
             _ => panic!("expected Machine"),
         }
     }
