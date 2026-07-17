@@ -866,20 +866,36 @@ pub async fn verify_chirp_id_token(
 
     // Provenance enforcement: the environment is fixed by the configured issuer
     // (hence which keyset verified this token — `claims.iss` was just confirmed
-    // to equal `config.issuer`). The token's own `test` claim must agree:
-    //   - Production issuer  ⇒ token must NOT be `test: true`.
-    //   - Test issuer        ⇒ token MUST be `test: true`.
-    // Either disagreement fails closed. This makes the environment axis a
-    // hard boundary rather than a per-call opt-in a caller might forget.
+    // to equal `config.issuer`). It is the authoritative axis; the `test` claim
+    // is a defense-in-depth cross-check whose form differs by token shape:
+    //
+    //   - Non-machine (human) tokens carry `test: true` iff they are test tokens,
+    //     so the claim must AGREE with the issuer-derived environment:
+    //       production issuer ⇒ must NOT be `test: true`;
+    //       test issuer       ⇒ MUST be `test: true`.
+    //   - Machine tokens NEVER carry `test: true` — `act: "machine"` + `test: true`
+    //     is unrepresentable at mint (INV-09); a test-keyset machine token is a
+    //     `Machine` principal whose test-ness is purely its issuer/keyset. So for
+    //     machines the environment comes from provenance alone, and a machine
+    //     token that smuggles `test: true` is rejected as malformed.
+    //
+    // Either disagreement fails closed, keeping the environment axis a hard
+    // boundary rather than a per-call opt-in a caller might forget.
     let environment = config.environment();
     let token_is_test = claims.test == Some(true);
-    let token_environment = if token_is_test {
-        Environment::Test
+    if is_machine {
+        if token_is_test {
+            return Err(ChirpAuthError::MalformedMachineToken);
+        }
     } else {
-        Environment::Production
-    };
-    if token_environment != environment {
-        return Err(ChirpAuthError::EnvironmentMismatch);
+        let token_environment = if token_is_test {
+            Environment::Test
+        } else {
+            Environment::Production
+        };
+        if token_environment != environment {
+            return Err(ChirpAuthError::EnvironmentMismatch);
+        }
     }
 
     let sub = claims.sub.trim().to_owned();
@@ -1996,18 +2012,21 @@ mod verify_path_tests {
         }
     }
 
-    /// A machine token under a test issuer stays `Machine` (the service
-    /// classifies machine before test); its test provenance rides the
-    /// [`Environment`] axis, not the identity variant. Confirms the test-env
-    /// `Test` carve-out does not swallow a test-env machine principal.
+    /// A TEST-KEYSET MACHINE token verifies as `Machine` + `Environment::Test`.
+    /// Its test-ness is purely the issuer/keyset — it carries NO `test: true`
+    /// claim (a real chirp-minted machine token never can: `act: "machine"` +
+    /// `test: true` is unrepresentable at mint, INV-09), and its `test:`-
+    /// namespaced subs pass verify unchanged (the Machine arm does not constrain
+    /// the sub form). This is the shape the Warden agent-under-grant E2E rides.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_rp_machine_token_is_machine_not_test() {
         let jwks = start_jwks_server(jwks_body_with_test_key()).await;
         let (config, test_iss) = test_issuer_config(jwks);
         let exp = now_unix() + 3600;
         let foreign_client = "cs_live_agent";
+        // A real test-machine: act:"machine", test:-namespaced subs, NO test claim.
         let claims = format!(
-            r#"{{"iss":"{test_iss}","sub":"agent_test","aud":"{foreign_client}","exp":{exp},"act":"machine","owner_sub":"sub_owner","test":true}}"#
+            r#"{{"iss":"{test_iss}","sub":"test:agent_probe","aud":"{foreign_client}","exp":{exp},"act":"machine","owner_sub":"test:sub_owner"}}"#
         );
         let token = make_signed_jwt(&good_header(), &claims);
         let verified = verify_chirp_id_token(
@@ -2017,9 +2036,40 @@ mod verify_path_tests {
             VerifyOptions::accept_machine_clients([foreign_client.to_owned()]),
         )
         .await
-        .expect("verify test-env machine token");
+        .expect("verify test-keyset machine token");
         assert_eq!(verified.environment, Environment::Test);
-        assert!(matches!(verified.identity, ChirpVerifiedIdentity::Machine { .. }));
+        match verified.identity {
+            ChirpVerifiedIdentity::Machine { sub, owner_sub, .. } => {
+                assert_eq!(sub, "test:agent_probe");
+                assert_eq!(owner_sub, "test:sub_owner");
+            }
+            other => panic!("expected Machine, got {other:?}"),
+        }
+    }
+
+    /// A machine token that smuggles `test: true` is rejected as malformed.
+    /// `act: "machine"` + `test: true` is unrepresentable at mint (INV-09), so
+    /// its presence means a hand-forged token — never accept it as either a
+    /// production or a test machine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn machine_token_with_test_claim_is_malformed() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let (config, test_iss) = test_issuer_config(jwks);
+        let exp = now_unix() + 3600;
+        let foreign_client = "cs_live_agent";
+        let claims = format!(
+            r#"{{"iss":"{test_iss}","sub":"test:agent_probe","aud":"{foreign_client}","exp":{exp},"act":"machine","owner_sub":"test:sub_owner","test":true}}"#
+        );
+        let token = make_signed_jwt(&good_header(), &claims);
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config,
+            &token,
+            VerifyOptions::accept_machine_clients([foreign_client.to_owned()]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::MalformedMachineToken), "got {err:?}");
     }
 
     /// Test RP + non-test token → rejected. The symmetric direction: a test
