@@ -1,6 +1,6 @@
 [package]
 name = "chirp-auth-client"
-version = "0.14.2"
+version = "0.15.0"
 edition = "2021"
 description = "Shared client-side library for ChirpAuth: ID-token verification plus machine-token minting."
 license = "MIT OR Apache-2.0"
@@ -12,6 +12,11 @@ categories = ["authentication", "web-programming"]
 
 [dependencies]
 base64 = "0.22"
+# The platform-canonical `Environment` (Prod | Test{tenant}) lives here and is
+# re-exported, so there is ONE definition of the prod/test boundary rather than
+# a tenant-less fork in this crate. `capability` is a leaf crate (its only dep
+# is optional serde), so this adds no transitive weight.
+capability = { git = "https://github.com/stackwell-labs/capability.git", tag = "v0.4.0", default-features = false }
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"

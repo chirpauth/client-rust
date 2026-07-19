@@ -146,10 +146,10 @@ impl ChirpAuthConfig {
 
     /// The [`Environment`] this config's issuer belongs to — the provenance
     /// the verifier enforces. A production issuer yields
-    /// [`Environment::Production`]; a `…/test/{tenant}` issuer yields
+    /// [`Environment::Prod`]; a `…/test/{tenant}` issuer yields
     /// [`Environment::Test`].
     pub fn environment(&self) -> Environment {
-        Environment::from_issuer(&self.issuer)
+        environment_from_issuer(&self.issuer)
     }
 
     /// Build a config from `{prefix}_ISSUER` and `{prefix}_AUDIENCE` env vars.
@@ -267,20 +267,29 @@ impl ChirpVerifiedIdentity {
 /// it is unreachable by construction (a test token's `kid` is absent from the
 /// prod JWKS and its `iss` won't match). Carry this into trust decisions so a
 /// test identity can never be mistaken for a production one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Environment {
-    Production,
-    Test,
-}
+pub use capability::Environment;
 
-impl Environment {
-    /// Classify a verified issuer. A test issuer ends in a single non-empty
-    /// `/test/{tenant}` segment; everything else is production.
-    pub fn from_issuer(issuer: &str) -> Self {
-        match issuer.trim_end_matches('/').rsplit_once("/test/") {
-            Some((_, tenant)) if !tenant.is_empty() && !tenant.contains('/') => Environment::Test,
-            _ => Environment::Production,
-        }
+/// Classify a verified issuer onto the platform-canonical
+/// [`capability::Environment`]. A test issuer ends in a single non-empty
+/// `/test/{tenant}` segment, and that tenant is CARRIED — everything else is
+/// production.
+///
+/// This is a free function rather than an inherent method because
+/// [`Environment`] is owned by the `capability` crate (one definition
+/// platform-wide); the orphan rule puts inherent impls out of reach here, and
+/// the issuer-URL rule is chirp-specific knowledge that belongs in this crate
+/// rather than in the generic capability primitive.
+///
+/// Previously this returned a tenant-less `Test`, discarding the tenant it had
+/// already parsed. Relying parties that needed it (Pigeon, chirp-auth) each
+/// re-derived it with a hand-copied duplicate of this exact rule — the kind of
+/// mirrored parsing that drifts. The tenant now survives the boundary.
+pub fn environment_from_issuer(issuer: &str) -> Environment {
+    match issuer.trim_end_matches('/').rsplit_once("/test/") {
+        Some((_, tenant)) if !tenant.is_empty() && !tenant.contains('/') => Environment::Test {
+            tenant: tenant.to_owned(),
+        },
+        _ => Environment::Prod,
     }
 }
 
@@ -378,11 +387,14 @@ impl VerifiedIdentity {
     }
 
     /// The keyset provenance ([`Environment`]) this identity was verified under.
-    pub fn environment(&self) -> Environment {
+    ///
+    /// Returns a reference: [`Environment`] carries the test tenant and so is
+    /// no longer `Copy`. Callers that need an owned value can `.clone()`.
+    pub fn environment(&self) -> &Environment {
         match self {
             Self::Human { environment, .. }
             | Self::Machine { environment, .. }
-            | Self::Test { environment, .. } => *environment,
+            | Self::Test { environment, .. } => environment,
         }
     }
 
@@ -903,12 +915,14 @@ pub async fn verify_chirp_id_token(
             return Err(ChirpAuthError::MalformedMachineToken);
         }
     } else {
-        let token_environment = if token_is_test {
-            Environment::Test
-        } else {
-            Environment::Production
-        };
-        if token_environment != environment {
+        // Compare only the test-ness axis. The token's `test` claim is a bare
+        // bool and names no tenant; the TENANT comes solely from the issuer,
+        // which is authoritative because that issuer's per-tenant JWKS is what
+        // verified this signature. Deriving the tenant from the keyset that
+        // actually validated the token — rather than from anything the token
+        // asserts about itself — is what keeps it unforgeable.
+        let config_is_test = matches!(environment, Environment::Test { .. });
+        if token_is_test != config_is_test {
             return Err(ChirpAuthError::EnvironmentMismatch);
         }
     }
@@ -964,8 +978,8 @@ pub async fn verify_chirp_id_token(
     // configured issuer, so this match is exhaustive over the reachable cases:
     // a production RP only ever reaches `Human`, a test RP only `Test`.
     let identity = match environment {
-        Environment::Production => ChirpVerifiedIdentity::Human { sub },
-        Environment::Test => ChirpVerifiedIdentity::Test { sub },
+        Environment::Prod => ChirpVerifiedIdentity::Human { sub },
+        Environment::Test { .. } => ChirpVerifiedIdentity::Test { sub },
     };
     Ok(ChirpVerifiedToken {
         environment,
@@ -1026,13 +1040,13 @@ mod tests {
         let config = ChirpAuthConfig::new("https://signin.chirpauth.com/", "drive");
         assert_eq!(config.issuer(), "https://signin.chirpauth.com");
         assert_eq!(config.jwks_uri(), "https://signin.chirpauth.com/jwks.json");
-        assert_eq!(config.environment(), Environment::Production);
+        assert_eq!(config.environment(), Environment::Prod);
     }
 
     #[test]
     fn default_issuer_is_production_environment() {
         let config = ChirpAuthConfig::new(DEFAULT_ISSUER, "drive");
-        assert_eq!(config.environment(), Environment::Production);
+        assert_eq!(config.environment(), Environment::Prod);
         assert_eq!(config.issuer(), "https://signin.chirpauth.com");
     }
 
@@ -1112,17 +1126,17 @@ mod tests {
     fn verified_identity_folds_token_axes() {
         // Human: carries sub + provenance, classifies as neither machine nor test.
         let human = VerifiedIdentity::from_token(ChirpVerifiedToken {
-            environment: Environment::Production,
+            environment: Environment::Prod,
             identity: ChirpVerifiedIdentity::Human { sub: "sub_h".into() },
         });
         assert_eq!(human.sub(), "sub_h");
-        assert_eq!(human.environment(), Environment::Production);
+        assert_eq!(human.environment(), &Environment::Prod);
         assert!(!human.is_machine());
         assert!(!human.is_test());
 
         // Machine: owner_sub + client_id survive the fold (previously discarded).
         let machine = VerifiedIdentity::from_token(ChirpVerifiedToken {
-            environment: Environment::Production,
+            environment: Environment::Prod,
             identity: ChirpVerifiedIdentity::Machine {
                 sub: "agent".into(),
                 owner_sub: "sub_owner".into(),
@@ -1145,11 +1159,11 @@ mod tests {
 
         // Test: provenance is Test and the class is distinguishable.
         let test = VerifiedIdentity::from_token(ChirpVerifiedToken {
-            environment: Environment::Test,
+            environment: Environment::Test { tenant: "acme".into() },
             identity: ChirpVerifiedIdentity::Test { sub: "sub_t".into() },
         });
         assert_eq!(test.sub(), "sub_t");
-        assert_eq!(test.environment(), Environment::Test);
+        assert_eq!(test.environment(), &Environment::Test { tenant: "acme".into() });
         assert!(test.is_test());
     }
 
@@ -1353,7 +1367,7 @@ mod verify_path_tests {
         )
         .await
         .expect("verify");
-        assert_eq!(identity.environment, Environment::Production);
+        assert_eq!(identity.environment, Environment::Prod);
         match identity.identity {
             ChirpVerifiedIdentity::Human { sub, .. } => {
                 assert_eq!(sub, "sub_test");
@@ -1770,7 +1784,7 @@ mod verify_path_tests {
         )
         .await
         .expect("verify machine (human audience not enforced; client_id allowlisted)");
-        assert_eq!(identity.environment, Environment::Production);
+        assert_eq!(identity.environment, Environment::Prod);
         match identity.identity {
             ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => {
                 assert_eq!(sub, "agent_test");
@@ -2013,7 +2027,7 @@ mod verify_path_tests {
         )
         .await
         .expect("verify");
-        assert_eq!(verified.environment, Environment::Production);
+        assert_eq!(verified.environment, Environment::Prod);
     }
 
     /// Production RP + test token → rejected with EnvironmentMismatch. This is
@@ -2049,7 +2063,7 @@ mod verify_path_tests {
         )
         .await
         .expect("verify test token under test RP");
-        assert_eq!(verified.environment, Environment::Test);
+        assert_eq!(verified.environment, Environment::Test { tenant: "acme".into() });
         // A non-machine token under a test issuer is a `Test` principal, NOT a
         // `Human` — the class follows the verified keyset's environment so a
         // test identity is structurally distinct from a production human.
@@ -2084,7 +2098,7 @@ mod verify_path_tests {
         )
         .await
         .expect("verify test-keyset machine token");
-        assert_eq!(verified.environment, Environment::Test);
+        assert_eq!(verified.environment, Environment::Test { tenant: "acme".into() });
         match verified.identity {
             ChirpVerifiedIdentity::Machine { sub, owner_sub, .. } => {
                 assert_eq!(sub, "test:agent_probe");
@@ -2157,16 +2171,40 @@ mod verify_path_tests {
 
     #[test]
     fn environment_from_issuer_classifies_provenance() {
-        use Environment::{Production, Test};
-        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com"), Production);
-        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/"), Production);
-        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/acme"), Test);
-        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/acme/"), Test);
+        let test = |tenant: &str| Environment::Test {
+            tenant: tenant.to_owned(),
+        };
+        let prod = Environment::Prod;
+        assert_eq!(environment_from_issuer("https://signin.chirpauth.com"), prod);
+        assert_eq!(environment_from_issuer("https://signin.chirpauth.com/"), prod);
+        // The tenant SURVIVES classification — this is the whole point of
+        // riding capability::Environment rather than a tenant-less fork.
+        assert_eq!(
+            environment_from_issuer("https://signin.chirpauth.com/test/acme"),
+            test("acme")
+        );
+        assert_eq!(
+            environment_from_issuer("https://signin.chirpauth.com/test/acme/"),
+            test("acme")
+        );
+        // Distinct tenants are distinct environments — `Environment` derives Eq
+        // per-tenant, so this is what stops one test tenant being mistaken for
+        // another downstream.
+        assert_ne!(
+            environment_from_issuer("https://signin.chirpauth.com/test/acme"),
+            environment_from_issuer("https://signin.chirpauth.com/test/other")
+        );
         // multi-segment after /test/ is not a valid single-tenant test issuer
-        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/a/b"), Production);
+        assert_eq!(
+            environment_from_issuer("https://signin.chirpauth.com/test/a/b"),
+            prod
+        );
         // empty tenant, and a host merely named "test", are production
-        assert_eq!(Environment::from_issuer("https://signin.chirpauth.com/test/"), Production);
-        assert_eq!(Environment::from_issuer("https://test.example.com"), Production);
+        assert_eq!(
+            environment_from_issuer("https://signin.chirpauth.com/test/"),
+            prod
+        );
+        assert_eq!(environment_from_issuer("https://test.example.com"), prod);
     }
 
     // -------------------- environment enforcement, quantified --------------
@@ -2202,15 +2240,15 @@ mod verify_path_tests {
                     ISS.to_string()
                 };
                 let config = ChirpAuthConfig::new(&issuer, AUD).with_jwks_uri(jwks);
+                // The issuer decides the environment (and, when test, the
+                // tenant); the token's `test` claim carries only a bool. The
+                // verifier accepts iff those two agree on test-ness.
                 let expected_env = if use_test_issuer {
-                    Environment::Test
+                    Environment::Test {
+                        tenant: tenant.clone(),
+                    }
                 } else {
-                    Environment::Production
-                };
-                let token_env = if token_is_test {
-                    Environment::Test
-                } else {
-                    Environment::Production
+                    Environment::Prod
                 };
 
                 let test_field = if token_is_test { r#","test":true"# } else { "" };
@@ -2227,7 +2265,7 @@ mod verify_path_tests {
                 )
                 .await;
 
-                let should_accept = expected_env == token_env;
+                let should_accept = use_test_issuer == token_is_test;
                 prop_assert_eq!(
                     result.is_ok(),
                     should_accept,
