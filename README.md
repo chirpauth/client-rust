@@ -37,7 +37,7 @@ let identity = verify_from_headers(
 .await?;
 
 match identity {
-    ChirpVerifiedIdentity::Human { sub, name, root_sub } => { /* ... */ }
+    ChirpVerifiedIdentity::Human { sub } => { /* ... */ }
     ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => { /* ... */ }
 }
 ```
