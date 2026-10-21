@@ -1,6 +1,6 @@
 [package]
 name = "chirp-auth-client"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 description = "Shared client-side library for ChirpAuth: ID-token verification plus machine-token minting."
 license = "MIT OR Apache-2.0"
@@ -24,6 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 time = { version = "0.3", features = ["std"] }
+# Async mutex for single-flight JWKS refresh. reqwest already depends on tokio,
+# so this adds no crate to the tree.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }

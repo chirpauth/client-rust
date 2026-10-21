@@ -4,7 +4,10 @@ A Rust client for verifying ID tokens issued by [ChirpAuth](https://signin.chirp
 
 ## What it does
 
-- Fetches the ChirpAuth JWKS on each verify call (caching is left to the caller).
+- Caches the ChirpAuth JWKS per process: one fetch per `max-age` (300 s from
+  ChirpAuth, capped at 10 min), an unknown `kid` refetches at most every 30 s,
+  concurrent misses share one fetch. A failed fetch is `ChirpAuthError::JwksFetch`
+  (upstream unavailable — answer 503), distinct from every bad-token error (401).
 - Verifies RS256-signed ID tokens against the published signing keys.
 - Validates the standard OIDC claims (`iss`, `aud`, `exp`).
 - Dispatches on the `act` claim to distinguish human-issued from machine-issued tokens.
@@ -60,7 +63,7 @@ per-call flag; it is derived from the configured issuer's `Environment`.
 ### Lower-level surface
 
 - `bearer_token(&HeaderMap) -> Option<&str>` — strip/validate a bearer token.
-- `fetch_jwks(...)` + `verify_rs256_jws(config, token, validate_aud)` — reuse the
+- `fetch_jwks(...)` (uncached) + `verify_rs256_jws(config, token, validate_aud)` (cached) — reuse the
   audited RS256 verifier for other ChirpAuth-signed artifacts (e.g. key-binding
   certificates) instead of re-implementing JWKS fetch and signature checks.
 
