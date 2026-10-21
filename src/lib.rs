@@ -54,7 +54,19 @@
 //!
 //! Test-acceptance is therefore derived from the issuer's environment, not from
 //! a per-call flag.
+//!
+//! ## JWKS caching (0.17)
+//!
+//! Verification resolves signing keys through a per-process cache keyed by JWKS
+//! URL, so a relying party's request rate is no longer its load on ChirpAuth.
+//! A cached keyset is trusted for the response's `Cache-Control: max-age`
+//! clamped to 30 s..=10 min (ChirpAuth sends 300 s), which bounds how long a key
+//! removed from the JWKS keeps verifying. An unknown `kid` refetches at most once
+//! per 30 s; concurrent misses share one fetch. A failed fetch is
+//! [`ChirpAuthError::JwksFetch`], never a silent fallback to stale keys. Caching
+//! changes when keys are fetched, not which are trusted.
 
+mod jwks_cache;
 pub mod mint;
 
 use base64::Engine as _;
@@ -486,6 +498,11 @@ pub enum ChirpAuthError {
     MalformedToken,
     #[error("unsupported alg")]
     UnsupportedAlgorithm,
+    /// The JWKS needed to check this token could not be fetched (transport
+    /// error, timeout, non-2xx such as a 429 throttle, or an unparseable body).
+    /// This says nothing about the token: it is ChirpAuth (or the path to it)
+    /// being unavailable, and a relying party should answer 503, not 401. Every
+    /// other variant is a verdict on the token itself.
     #[error("jwks fetch failed: {0}")]
     JwksFetch(String),
     #[error("no matching key")]
@@ -671,24 +688,36 @@ pub fn bearer_token(headers: &http::HeaderMap) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Fetch and parse the JWKS document at `config.jwks_uri`.
+/// Fetch and parse the JWKS document at `config.jwks_uri`, uncached.
 ///
-/// Exposed so key-binding-certificate verification (and any other downstream
-/// RS256 use) can reuse one fetch+parse path instead of re-implementing it.
+/// The verify functions do NOT call this: they resolve keys through a
+/// per-process cache (see "JWKS caching" in the crate docs). This is for callers
+/// that genuinely want the current document, e.g. to inspect or re-publish it.
+/// Any failure (transport, non-2xx, unparseable body) is
+/// [`ChirpAuthError::JwksFetch`].
 pub async fn fetch_jwks(
     client: &reqwest::Client,
     config: &ChirpAuthConfig,
 ) -> Result<Jwks, ChirpAuthError> {
-    client
-        .get(&config.jwks_uri)
-        .send()
+    jwks_cache::fetch_document(client, &config.jwks_uri)
         .await
-        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))?
-        .error_for_status()
-        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))?
-        .json::<Jwks>()
-        .await
-        .map_err(|error| ChirpAuthError::JwksFetch(error.to_string()))
+        .map(|(jwks, _max_age)| jwks)
+        .map_err(ChirpAuthError::JwksFetch)
+}
+
+/// The verifying key for `kid`, via the per-process JWKS cache. Only RS256
+/// keys are usable: a JWK that names another `alg` is refused here, for every
+/// verify path alike.
+async fn resolve_key(
+    client: &reqwest::Client,
+    config: &ChirpAuthConfig,
+    kid: &str,
+) -> Result<Jwk, ChirpAuthError> {
+    let key = jwks_cache::global().key(client, &config.jwks_uri, kid).await?;
+    if key.alg.as_deref().is_some_and(|alg| alg != "RS256") {
+        return Err(ChirpAuthError::UnsupportedAlgorithm);
+    }
+    Ok(key)
 }
 
 /// A verified RS256 JWS payload — the decoded claims after signature, `iss`,
@@ -751,16 +780,8 @@ pub async fn verify_rs256_jws(
         return Err(ChirpAuthError::InvalidTokenType);
     }
 
-    let jwks = fetch_jwks(client, config).await?;
-    let key = jwks
-        .keys
-        .iter()
-        .find(|key| key.kid == header.kid && key.kty == "RSA")
-        .ok_or(ChirpAuthError::NoMatchingKey)?;
-    if key.alg.as_deref().is_some_and(|alg| alg != "RS256") {
-        return Err(ChirpAuthError::UnsupportedAlgorithm);
-    }
-    verify_rsa_signature(key, parts.signing_input.as_bytes(), &signature)?;
+    let key = resolve_key(client, config, &header.kid).await?;
+    verify_rsa_signature(&key, parts.signing_input.as_bytes(), &signature)?;
 
     let raw: serde_json::Map<String, serde_json::Value> =
         serde_json::from_slice(&claims_bytes).map_err(|_| ChirpAuthError::MalformedToken)?;
@@ -882,9 +903,10 @@ pub async fn verify_chirp_resource_access_token(
 
 /// Verify a ChirpAuth-issued RS256 ID token end-to-end.
 ///
-/// Fetches `config.jwks_uri` each call — callers that want caching should layer
-/// it on top (ChirpAuth JWKS rotation is on the order of hours/days; per-request
-/// fetch is fine for current call volumes but worth revisiting if hot).
+/// Keys come from the per-process JWKS cache (see "JWKS caching" in the crate
+/// docs): a steady stream of verifies costs ChirpAuth one fetch per max-age, not
+/// one per call. If a needed fetch fails, the result is
+/// [`ChirpAuthError::JwksFetch`] — upstream unavailable, not a bad token.
 ///
 /// Returns a [`ChirpVerifiedIdentity`] — `Machine` when `act == "machine"`,
 /// else `Test` under a test issuer or `Human` under a production issuer (the
@@ -937,16 +959,8 @@ pub async fn verify_chirp_id_token(
         return Err(ChirpAuthError::InvalidTokenType);
     }
 
-    let jwks = fetch_jwks(client, config).await?;
-    let key = jwks
-        .keys
-        .iter()
-        .find(|key| key.kid == header.kid && key.kty == "RSA")
-        .ok_or(ChirpAuthError::NoMatchingKey)?;
-    if key.alg.as_deref().is_some_and(|alg| alg != "RS256") {
-        return Err(ChirpAuthError::UnsupportedAlgorithm);
-    }
-    verify_rsa_signature(key, parts.signing_input.as_bytes(), &signature)?;
+    let key = resolve_key(client, config, &header.kid).await?;
+    verify_rsa_signature(&key, parts.signing_input.as_bytes(), &signature)?;
 
     let claims: ChirpClaims = serde_json::from_slice(&claims_bytes)
         .map_err(|_| ChirpAuthError::MalformedToken)?;
@@ -1721,6 +1735,79 @@ mod verify_path_tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ChirpAuthError::NoMatchingKey), "got {err:?}");
+    }
+
+    /// Like `start_jwks_server`, but answers every request with `status` and
+    /// counts the requests it served.
+    async fn start_counting_jwks_server(
+        status: u16,
+        body: String,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/jwks.json", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let task_hits = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (body, hits) = (body.clone(), task_hits.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nCache-Control: public, max-age=300\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (url, hits)
+    }
+
+    /// The point of the cache, end to end: a burst of verifies against one
+    /// issuer costs ChirpAuth one JWKS fetch, on both verify entry points.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_verifies_fetch_the_jwks_once() {
+        let (jwks, hits) = start_counting_jwks_server(200, jwks_body_with_test_key()).await;
+        let config = config_pointing_at(jwks);
+        let client = reqwest::Client::new();
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        let verifies: Vec<_> = (0..40)
+            .map(|_| {
+                let (client, config, token) = (client.clone(), config.clone(), token.clone());
+                tokio::spawn(async move {
+                    verify_chirp_id_token(&client, &config, &token, VerifyOptions::default()).await
+                })
+            })
+            .collect();
+        for verify in verifies {
+            verify.await.unwrap().expect("verify");
+        }
+        verify_rs256_jws(&client, &config, &token, true, ID_TOKEN_TYP)
+            .await
+            .expect("jws verify");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An upstream that cannot serve the JWKS (here: API Gateway's 429
+    /// throttle) is `JwksFetch` — distinguishable from every bad-token verdict,
+    /// so a relying party can answer 503 instead of a misleading 401.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_throttled_jwks_is_jwks_fetch_not_a_token_verdict() {
+        let (jwks, _) = start_counting_jwks_server(429, r#"{"message":"Too Many Requests"}"#.into()).await;
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, AUD, now_unix() + 3600));
+        let err = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &config_pointing_at(jwks),
+            &token,
+            VerifyOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::JwksFetch(_)), "got {err:?}");
     }
 
     /// Machine tokens are rejected by default. Every Drive/Pigeon/Social-
