@@ -584,6 +584,20 @@ struct ChirpClaims {
     test: Option<bool>,
 }
 
+/// The standard claims [`verify_rs256_jws`] checks. Unlike [`ChirpClaims`] (ID
+/// tokens, which always carry `aud`), `aud` is optional here: some
+/// ChirpAuth-signed artifacts name no relying party. A key-binding cert binds an
+/// identity to a key, so ChirpAuth mints it with no `aud` at all. An absent `aud`
+/// is rejected only when the caller asks for audience validation.
+#[derive(Debug, Deserialize)]
+struct JwsClaims {
+    iss: String,
+    sub: String,
+    #[serde(default)]
+    aud: Option<AudienceClaim>,
+    exp: i64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum AudienceClaim {
@@ -727,6 +741,8 @@ async fn resolve_key(
 pub struct Claims {
     pub iss: String,
     pub sub: String,
+    /// Empty when the token carries no `aud` (possible only when it was
+    /// verified with `validate_aud = false`).
     pub aud: Vec<String>,
     pub exp: i64,
     /// The raw JSON object of all claims, for callers that need claims beyond
@@ -744,7 +760,10 @@ pub struct Claims {
 /// Checks: RS256 alg pin (header and JWK), the `typ` header equals
 /// `expected_typ`, kid lookup in the JWKS, signature, exact `iss ==
 /// config.issuer`, and `exp` in the future. When `validate_aud` is `true`, also
-/// requires at least one `aud` value in [`ChirpAuthConfig::accepted_audiences`].
+/// requires at least one `aud` value in [`ChirpAuthConfig::accepted_audiences`]
+/// (a token with no `aud` is then [`ChirpAuthError::MalformedToken`]). When it is
+/// `false`, `aud` may be absent, as it is on a key-binding cert, and
+/// [`Claims::aud`] comes back empty.
 /// Does **not** apply machine/test policy — that lives in
 /// [`verify_chirp_id_token`].
 ///
@@ -785,22 +804,28 @@ pub async fn verify_rs256_jws(
 
     let raw: serde_json::Map<String, serde_json::Value> =
         serde_json::from_slice(&claims_bytes).map_err(|_| ChirpAuthError::MalformedToken)?;
-    let claims: ChirpClaims =
+    let claims: JwsClaims =
         serde_json::from_slice(&claims_bytes).map_err(|_| ChirpAuthError::MalformedToken)?;
 
     if claims.iss != config.issuer {
         return Err(ChirpAuthError::ClaimMismatch);
     }
-    if validate_aud && !claims.aud.matches_any(&config.accepted_audiences) {
-        return Err(ChirpAuthError::ClaimMismatch);
+    if validate_aud {
+        // Validating an audience the token doesn't carry is a malformed token,
+        // as it is on the ID-token path.
+        let aud = claims.aud.as_ref().ok_or(ChirpAuthError::MalformedToken)?;
+        if !aud.matches_any(&config.accepted_audiences) {
+            return Err(ChirpAuthError::ClaimMismatch);
+        }
     }
     if claims.exp <= OffsetDateTime::now_utc().unix_timestamp() {
         return Err(ChirpAuthError::Expired);
     }
 
-    let aud = match &claims.aud {
-        AudienceClaim::One(a) => vec![a.clone()],
-        AudienceClaim::Many(many) => many.clone(),
+    let aud = match claims.aud {
+        None => Vec::new(),
+        Some(AudienceClaim::One(a)) => vec![a],
+        Some(AudienceClaim::Many(many)) => many,
     };
     Ok(Claims {
         iss: claims.iss,
@@ -1975,6 +2000,42 @@ mod verify_path_tests {
             .await
             .expect("verify without aud validation");
         assert_eq!(verified.sub, "sub_test");
+    }
+
+    /// A key-binding cert as ChirpAuth mints it carries no `aud` at all
+    /// (social-graph#35). Without audience validation it verifies, and its
+    /// `aud` comes back empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_rs256_jws_accepts_absent_aud_when_not_validating() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let config = config_pointing_at(jwks);
+        let exp = now_unix() + 3600;
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"sub_test","cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"abc"}}}},"iat":{iat},"exp":{exp},"typ":"chirp-key-binding"}}"#,
+            iat = now_unix()
+        );
+        let header = format!(r#"{{"alg":"RS256","typ":"{KEYBIND_TYP}","kid":"{KID}"}}"#);
+        let token = make_signed_jwt(&header, &claims);
+        let verified = verify_rs256_jws(&reqwest::Client::new(), &config, &token, false, KEYBIND_TYP)
+            .await
+            .expect("verify an aud-less keybind cert");
+        assert_eq!(verified.sub, "sub_test");
+        assert!(verified.aud.is_empty());
+        assert!(verified.raw.get("cnf").is_some());
+    }
+
+    /// Asking for audience validation of a token with no `aud` still fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_rs256_jws_rejects_absent_aud_when_validating() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let config = config_pointing_at(jwks);
+        let exp = now_unix() + 3600;
+        let claims = format!(r#"{{"iss":"{ISS}","sub":"sub_test","exp":{exp}}}"#);
+        let token = make_signed_jwt(&good_header(), &claims);
+        let err = verify_rs256_jws(&reqwest::Client::new(), &config, &token, true, ID_TOKEN_TYP)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::MalformedToken));
     }
 
     /// Machine tokens are rejected by default. (kept as a paired inverse below)
