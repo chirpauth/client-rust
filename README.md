@@ -60,6 +60,32 @@ and a test-configured RP (issuer `…/test/{tenant}`) rejects a non-test token,
 both with `ChirpAuthError::EnvironmentMismatch`. Test-acceptance is no longer a
 per-call flag; it is derived from the configured issuer's `Environment`.
 
+### App events (account deletion)
+
+ChirpAuth POSTs a signed `user.deleted` event to an app's deletion webhook when
+someone deletes their account. Verify it with one call; keep only your audience
+choice and your side effect:
+
+```rust
+use chirp_auth_client::{ChirpEvent, EventRejection, verify_chirp_event};
+
+// The client ids whose pairwise subs this app stores.
+let audiences = BTreeSet::from(["cs_live_your_client_id".to_owned()]);
+match verify_chirp_event(&http_client, &config, &body, &audiences).await {
+    Ok(ChirpEvent::UserDeleted { sub, event_id, deleted_at }) => { /* erase `sub`, idempotently */ }
+    Err(EventRejection::Unverified(_)) => { /* 401 */ }
+    Err(EventRejection::Invalid(_)) => { /* 400 */ }
+    Err(EventRejection::KeysUnavailable(_)) => { /* 503 */ }
+}
+```
+
+It checks `typ: chirp-event+jwt` and RS256 before any fetch, the signature
+against `{issuer}/events/jwks.json` (cached; an unknown `kid` refetches), `iss`,
+`aud` in your set and equal to `client_id`, `iat` within 10 min (60 s skew),
+`jti == event_id`, and a well-formed `sub` (non-empty, at most 128 bytes, no
+control characters). For tests, the `testkit` feature (dev-dependencies only)
+provides `TestSigningKey`, `JwksServer` and `user_deleted_claims`.
+
 ### Lower-level surface
 
 - `bearer_token(&HeaderMap) -> Option<&str>` — strip/validate a bearer token.

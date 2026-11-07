@@ -65,9 +65,24 @@
 //! per 30 s; concurrent misses share one fetch. A failed fetch is
 //! [`ChirpAuthError::JwksFetch`], never a silent fallback to stale keys. Caching
 //! changes when keys are fetched, not which are trusted.
+//!
+//! ## App events (0.18)
+//!
+//! [`verify_chirp_event`] verifies the signed events ChirpAuth POSTs to an app's
+//! webhook (today `user.deleted`, sent when someone deletes their Chirp
+//! account): typ and alg before any fetch, the signature against
+//! `{issuer}/events/jwks.json`, `iat` within 10 min (60 s skew), the caller's
+//! accepted audiences, and the `sub`. It returns a typed [`ChirpEvent`] or an
+//! [`EventRejection`]. See [`events`]. The `testkit` feature adds fixed signing
+//! keys and an in-process JWKS server for receivers' tests.
 
+pub mod events;
 mod jwks_cache;
 pub mod mint;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
+
+pub use events::{ChirpEvent, EventRejection, verify_chirp_event};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

@@ -1,6 +1,6 @@
 [package]
 name = "chirp-auth-client"
-version = "0.17.1"
+version = "0.18.0"
 edition = "2021"
 description = "Shared client-side library for ChirpAuth: ID-token verification plus machine-token minting."
 license = "MIT OR Apache-2.0"
@@ -27,6 +27,11 @@ time = { version = "0.3", features = ["std"] }
 # Async mutex for single-flight JWKS refresh. reqwest already depends on tokio,
 # so this adds no crate to the tree.
 tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[features]
+# Test support for receivers: fixed signing keys and an in-process JWKS server
+# (`chirp_auth_client::testkit`). Enable from `[dev-dependencies]` only.
+testkit = ["tokio/rt", "tokio/net", "tokio/io-util"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }
