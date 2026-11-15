@@ -18,7 +18,7 @@ A Rust client for verifying ID tokens issued by [ChirpAuth](https://signin.chirp
 
 ```rust
 use chirp_auth_client::{
-    ChirpAuthConfig, ChirpVerifiedIdentity, DEFAULT_ISSUER, VerifyOptions,
+    Caller, ChirpAuthConfig, DEFAULT_ISSUER, Environment, Verified, VerifyOptions,
     verify_from_headers,
 };
 
@@ -31,7 +31,7 @@ let http_client = reqwest::Client::new();
 // To accept machine (agent) tokens, name the minting `client_id`s you trust.
 // The set fails closed: an empty set accepts no machine token. This is the one
 // place the machine-`client_id` allowlist lives — you no longer hand-roll it.
-let identity = verify_from_headers(
+let Verified { environment, caller } = verify_from_headers(
     &http_client,
     request_headers,
     &config,
@@ -39,21 +39,26 @@ let identity = verify_from_headers(
 )
 .await?;
 
-match identity {
-    ChirpVerifiedIdentity::Human { sub, name, root_sub } => { /* ... */ }
-    ChirpVerifiedIdentity::Machine { sub, owner_sub, client_id } => { /* ... */ }
+// `environment` is which keyset verified the token (`Environment::Prod`, or
+// `Environment::Test { tenant }` for a `…/test/{tenant}` issuer). It is the only
+// place prod-or-test lives: a caller carries no environment.
+match caller {
+    // `client_id` is the one accepted audience the token was verified against.
+    Caller::Human { sub, client_id } => { /* ... */ }
+    Caller::Machine { sub, owner_sub, client_id } => { /* ... */ }
 }
 ```
 
 `ChirpAuthConfig::with_audiences(issuer, audiences)` builds an audience
-allowlist (a token is accepted if any of its `aud` values is in the set, checked
-in one pass). `ChirpAuthConfig::from_env(prefix)` reads
+allowlist: a person's token is accepted if exactly one distinct `aud` value is in
+the set, and that value is its `Caller::Human.client_id`; a token naming two
+accepted audiences is refused as ambiguous. `ChirpAuthConfig::from_env(prefix)` reads
 `{PREFIX}_ISSUER` / `{PREFIX}_AUDIENCE` from the environment (empty prefix for
 unprefixed `CHIRP_AUTH_*`).
 
 ### Environment enforcement
 
-The verifier derives the expected `Environment` (`Production`/`Test`) from the
+The verifier derives the expected `Environment` (`Prod`/`Test { tenant }`) from the
 configured issuer and **rejects** a token whose provenance disagrees: a
 production-configured relying party rejects a test-issuer (`test: true`) token,
 and a test-configured RP (issuer `…/test/{tenant}`) rejects a non-test token,
